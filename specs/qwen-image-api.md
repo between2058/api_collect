@@ -75,29 +75,17 @@ Returns server status and GPU lock state.
 
 Generate one or more images from a text prompt.
 
-**Request** — `application/json`
+**Request** — `multipart/form-data`
 
-```json
-{
-  "prompt": "A sleek sports car on a mountain road at sunset",
-  "negative_prompt": "low quality, bad anatomy, blurry, distorted",
-  "aspect_ratio": "16:9",
-  "num_steps": 50,
-  "cfg_scale": 4.0,
-  "seed": 42,
-  "num_samples": 1
-}
-```
-
-| Field | Type | Default | Constraints | Description |
-|---|---|---|---|---|
-| `prompt` | `string` | — | Required | Generation prompt |
-| `negative_prompt` | `string` | `"low quality, bad anatomy, blurry, distorted"` | — | Negative prompt |
-| `aspect_ratio` | `string` | `"16:9"` | One of the values in the table below | Output image aspect ratio |
-| `num_steps` | `integer` | `50` | > 0 | Number of diffusion steps |
-| `cfg_scale` | `float` | `4.0` | > 0 | Classifier-free guidance scale |
-| `seed` | `integer` | random | — | RNG seed; ignored at runtime — each sample always gets its own independent random seed |
-| `num_samples` | `integer` | `1` | `1`–`8` | Number of images to generate in one call |
+| Field | Type | Required | Default | Constraints | Description |
+|---|---|---|---|---|---|
+| `prompt` | `string` (Form) | ✅ | — | — | Generation prompt |
+| `negative_prompt` | `string` (Form) | ❌ | `"low quality, bad anatomy, blurry, distorted"` | — | Negative prompt |
+| `aspect_ratio` | `string` (Form) | ❌ | `"16:9"` | One of the values in the table below | Output image aspect ratio |
+| `num_steps` | `integer` (Form) | ❌ | `50` | `1`–`100` | Number of diffusion steps |
+| `cfg_scale` | `float` (Form) | ❌ | `4.0` | `0.0`–`20.0` | Classifier-free guidance scale |
+| `seed` | `integer` (Form) | ❌ | `null` | — | Accepted but ignored — each sample always gets its own independent random seed |
+| `num_samples` | `integer` (Form) | ❌ | `1` | `1`–`8` | Number of images to generate in one call |
 
 **Aspect Ratio → Resolution Map**
 
@@ -147,14 +135,14 @@ Edit an image using a text instruction.
 
 **Request** — `multipart/form-data`
 
-| Field | Type | Required | Default | Description |
-|---|---|---|---|---|
-| `file` | `UploadFile` | ✅ | — | Input image |
-| `prompt` | `string` (Form) | ✅ | — | Editing instruction (e.g. `"Change the car color to red"`) |
-| `steps` | `integer` (Form) | ❌ | `40` | Diffusion steps |
-| `cfg_scale` | `float` (Form) | ❌ | `4.0` | Guidance scale |
-| `seed` | `integer` (Form) | ❌ | `42` | Accepted but ignored — each sample uses its own independent random seed |
-| `num_samples` | `integer` (Form) | ❌ | `1` | Number of result images to generate (`1`–`6`) |
+| Field | Type | Required | Default | Constraints | Description |
+|---|---|---|---|---|---|
+| `file` | `UploadFile` | ✅ | — | — | Input image |
+| `prompt` | `string` (Form) | ✅ | — | — | Editing instruction (e.g. `"Change the car color to red"`) |
+| `steps` | `integer` (Form) | ❌ | `40` | `1`–`100` | Diffusion steps |
+| `cfg_scale` | `float` (Form) | ❌ | `4.0` | `0.0`–`20.0` | Guidance scale |
+| `seed` | `integer` (Form) | ❌ | `42` | — | Accepted but ignored — each sample uses its own independent random seed |
+| `num_samples` | `integer` (Form) | ❌ | `1` | `1`–`6` | Number of result images to generate |
 
 **Success Response** — `200 OK`
 
@@ -191,13 +179,13 @@ Edit multiple images together using a single prompt. The model receives all imag
 
 **Request** — `multipart/form-data`
 
-| Field | Type | Required | Default | Description |
-|---|---|---|---|---|
-| `files` | `List[UploadFile]` | ✅ | — | 1–N input images |
-| `prompt` | `string` (Form) | ✅ | — | Editing instruction |
-| `steps` | `integer` (Form) | ❌ | `40` | Diffusion steps |
-| `cfg_scale` | `float` (Form) | ❌ | `4.0` | Guidance scale |
-| `seed` | `integer` (Form) | ❌ | `42` | RNG seed |
+| Field | Type | Required | Default | Constraints | Description |
+|---|---|---|---|---|---|
+| `files` | `List[UploadFile]` | ✅ | — | — | 1–N input images |
+| `prompt` | `string` (Form) | ✅ | — | — | Editing instruction |
+| `steps` | `integer` (Form) | ❌ | `40` | `1`–`100` | Diffusion steps |
+| `cfg_scale` | `float` (Form) | ❌ | `4.0` | `0.0`–`20.0` | Guidance scale |
+| `seed` | `integer` (Form) | ❌ | `42` | — | RNG seed |
 
 **Success Response** — `200 OK`
 
@@ -240,9 +228,9 @@ Synthesise a new view of an object from a different camera angle.
 |---|---|---|---|---|---|
 | `file` | `UploadFile` | ✅ | — | — | Input image (resized to 1024×1024 internally) |
 | `mode` | `string` (Form) | ❌ | `"custom"` | `"custom"` or `"multi"` | `"custom"` = one view; `"multi"` = right/back/left views |
-| `azimuth` | `float` (Form) | ❌ | `0` | `[0, 360)` | Horizontal rotation in degrees |
-| `elevation` | `float` (Form) | ❌ | `0` | `-30` to `60` | Vertical angle in degrees |
-| `distance` | `float` (Form) | ❌ | `1.0` | `0.6`, `1.0`, or `1.8` | Camera distance |
+| `azimuth` | `float` (Form) | ❌ | `0` | `0.0`–`360.0` | Horizontal rotation in degrees; snapped to nearest supported value |
+| `elevation` | `float` (Form) | ❌ | `0` | `-30.0`–`60.0` | Vertical angle in degrees; snapped to nearest supported value |
+| `distance` | `float` (Form) | ❌ | `1.0` | `0.6`–`1.8` | Camera distance; snapped to nearest supported value |
 
 > `azimuth`, `elevation`, and `distance` are only used when `mode="custom"`.
 

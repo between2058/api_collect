@@ -9,7 +9,7 @@ import random
 import torch
 import tempfile
 import numpy as np
-from typing import Dict, List, Optional
+from typing import Dict, List, Literal, Optional
 from PIL import Image
 
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
@@ -195,16 +195,6 @@ ASPECT_RATIOS = {
     "4:3": (1472, 1104), "3:4": (1104, 1472), "3:2": (1584, 1056), "2:3": (1056, 1584),
 }
 
-# --- Request Models ---
-class Text2ImgRequest(BaseModel):
-    prompt: str
-    negative_prompt: str = "low quality, bad anatomy, blurry, distorted"
-    aspect_ratio: str = "16:9"  # Keys in ASPECT_RATIOS
-    num_steps: int = 50
-    cfg_scale: float = 4.0
-    seed: int = Field(default_factory=lambda: random.randint(0, MAX_SEED))
-    num_samples: int = 1  # 生成張數，每張使用獨立隨機 seed
-
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
     return {
@@ -218,7 +208,15 @@ async def health_check():
 # MODEL 1: Text-to-Image (Text -> Image)
 # ==========================================
 @app.post("/text2img", response_model=Text2ImgResponse, responses=GPU_ERROR_RESPONSES)
-async def text_to_image(req: Text2ImgRequest):
+async def text_to_image(
+    prompt: str = Form(..., description="生成提示詞"),
+    negative_prompt: str = Form("low quality, bad anatomy, blurry, distorted", description="負向提示詞"),
+    aspect_ratio: Literal["1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3"] = Form("16:9", description="輸出圖片長寬比"),
+    num_steps: int = Form(50, ge=1, le=100, description="擴散步數"),
+    cfg_scale: float = Form(4.0, ge=0.0, le=20.0, description="Classifier-free guidance scale"),
+    seed: Optional[int] = Form(None, description="Accepted but ignored — each sample uses its own independent random seed"),
+    num_samples: int = Form(1, ge=1, le=8, description="一次生成的圖片數量（1–8）"),
+):
     """
     [Model 1] Qwen-Image-2512
     輸入: 純文字 Prompt
@@ -228,18 +226,8 @@ async def text_to_image(req: Text2ImgRequest):
     req_dir = os.path.join(OUTPUT_DIR, request_id)
     os.makedirs(req_dir, exist_ok=True)
 
-    if req.aspect_ratio not in ASPECT_RATIOS:
-        raise HTTPException(
-            status_code=422,
-            detail=f"Invalid aspect_ratio '{req.aspect_ratio}'. Must be one of: {list(ASPECT_RATIOS.keys())}",
-        )
-    if not (1 <= req.num_samples <= 8):
-        raise HTTPException(
-            status_code=422,
-            detail="num_samples must be between 1 and 8",
-        )
-    width, height = ASPECT_RATIOS[req.aspect_ratio]
-    print(f"📝 [Text2Img] ID: {request_id} | Prompt: {req.prompt[:50]}... | Size: {width}x{height} | Samples: {req.num_samples}")
+    width, height = ASPECT_RATIOS[aspect_ratio]
+    print(f"📝 [Text2Img] ID: {request_id} | Prompt: {prompt[:50]}... | Size: {width}x{height} | Samples: {num_samples}")
 
     async with gpu_lock:
         def run_inference():
@@ -251,18 +239,18 @@ async def text_to_image(req: Text2ImgRequest):
                     torch_dtype=DTYPE
                 ).to(DEVICE)
 
-                seeds = [random.randint(0, MAX_SEED) for _ in range(req.num_samples)]
+                seeds = [random.randint(0, MAX_SEED) for _ in range(num_samples)]
                 paths = []
                 for i, seed_i in enumerate(seeds):
                     generator = torch.Generator(device=DEVICE).manual_seed(seed_i)
-                    print(f"🚀 Generating image {i+1}/{req.num_samples} (seed={seed_i})...")
+                    print(f"🚀 Generating image {i+1}/{num_samples} (seed={seed_i})...")
                     image = pipe(
-                        prompt=req.prompt,
-                        negative_prompt=req.negative_prompt,
+                        prompt=prompt,
+                        negative_prompt=negative_prompt,
                         width=width,
                         height=height,
-                        num_inference_steps=req.num_steps,
-                        true_cfg_scale=req.cfg_scale,
+                        num_inference_steps=num_steps,
+                        true_cfg_scale=cfg_scale,
                         generator=generator
                     ).images[0]
                     path = save_image(image, req_dir, f"output_{i}.png")
@@ -303,9 +291,9 @@ async def text_to_image(req: Text2ImgRequest):
 async def edit_image(
     file: UploadFile = File(...),
     prompt: str = Form(..., description="編輯指令"),
-    steps: int = Form(40),
-    cfg_scale: float = Form(4.0),
-    seed: int = Form(42),
+    steps: int = Form(40, ge=1, le=100, description="擴散步數"),
+    cfg_scale: float = Form(4.0, ge=0.0, le=20.0, description="Guidance scale"),
+    seed: int = Form(42, description="Accepted but ignored — each sample uses its own independent random seed"),
     num_samples: int = Form(1, ge=1, le=6, description="生成結果數量（1–6），每張使用獨立隨機 seed")
 ):
     """
@@ -388,9 +376,9 @@ async def edit_image(
 async def edit_multi_images(
     files: List[UploadFile] = File(..., description="上傳多張圖片"),
     prompt: str = Form(..., description="編輯指令"),
-    steps: int = Form(40),
-    cfg_scale: float = Form(4.0),
-    seed: int = Form(42)
+    steps: int = Form(40, ge=1, le=100, description="擴散步數"),
+    cfg_scale: float = Form(4.0, ge=0.0, le=20.0, description="Guidance scale"),
+    seed: int = Form(42, description="RNG seed")
 ):
     """
     [Model 2] 
@@ -483,10 +471,10 @@ async def edit_multi_images(
 @app.post("/angle", response_model=AngleResponse, responses=GPU_ERROR_RESPONSES)
 async def change_angle(
     file: UploadFile = File(...),
-    mode: str = Form("custom", description="'custom' for single angle, 'multi' for 3 views"),
-    azimuth: float = Form(0, description="Horizontal angle (0-360)"),
-    elevation: float = Form(0, description="Vertical angle (-30 to 60)"),
-    distance: float = Form(1.0, description="Distance (0.6, 1.0, 1.8)")
+    mode: Literal["custom", "multi"] = Form("custom", description="'custom' for single angle, 'multi' for 3 views (right/back/left)"),
+    azimuth: float = Form(0, ge=0.0, le=360.0, description="Horizontal rotation in degrees (0–360); snapped to nearest supported value"),
+    elevation: float = Form(0, ge=-30.0, le=60.0, description="Vertical angle in degrees (-30 to 60); snapped to nearest supported value"),
+    distance: float = Form(1.0, ge=0.6, le=1.8, description="Camera distance (0.6, 1.0, or 1.8); snapped to nearest supported value"),
 ):
     """
     [Model 3] Qwen-Image-Edit-2511 + Angle LoRAs
@@ -495,12 +483,6 @@ async def change_angle(
     """
     # 先驗證，再建立目錄與寫檔，避免無效請求留下垃圾檔案
     _validate_image_upload(file, "file")
-
-    if mode not in ("custom", "multi"):
-        raise HTTPException(
-            status_code=422,
-            detail=f"Invalid mode '{mode}'. Must be 'custom' or 'multi'.",
-        )
 
     request_id = str(uuid.uuid4())
     req_dir = os.path.join(OUTPUT_DIR, request_id)

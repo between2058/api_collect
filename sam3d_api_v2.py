@@ -2,17 +2,21 @@
 # SAM-3D API - FastAPI wrapper for SAM3D inference
 
 from fastapi import FastAPI, File, UploadFile, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+import asyncio
 import os
 import sys
 import uuid
 import shutil
 import tempfile
+import time
 import numpy as np
 import torch
 import trimesh
 from PIL import Image
+
+OUTPUT_CLEANUP_TTL = 60 * 60  # clean up output files after 1 hour
 
 # --- PyTorch3D Imports for Transformation Logic ---
 from pytorch3d.transforms import Transform3d, Rotate, Translate, Scale, quaternion_to_matrix
@@ -37,6 +41,22 @@ print(f"SAM-3D 輸出目錄: {OUTPUT_DIR}")
 # 全域模型實例
 inference = None
 
+# Track output directories for cleanup: {request_id: created_at}
+_output_registry: dict[str, float] = {}
+
+
+async def _output_cleanup_loop():
+    """Background task: remove output dirs older than OUTPUT_CLEANUP_TTL."""
+    while True:
+        await asyncio.sleep(30 * 60)  # check every 30 minutes
+        cutoff = time.time() - OUTPUT_CLEANUP_TTL
+        expired = [rid for rid, ts in list(_output_registry.items()) if ts < cutoff]
+        for rid in expired:
+            _output_registry.pop(rid, None)
+            job_dir = os.path.join(OUTPUT_DIR, rid)
+            shutil.rmtree(job_dir, ignore_errors=True)
+            print(f"🧹 Cleaned up expired output: {rid}")
+
 # --- Transformation Helpers (From provided script) ---
 
 def compose_transform(scale, rotation, translation):
@@ -57,7 +77,7 @@ _R_YUP_TO_ZUP = _R_ZUP_TO_YUP.T
 # -----------------------------------------------------
 
 @app.on_event("startup")
-async def load_model():
+async def startup():
     global inference
     try:
         from inference import Inference
@@ -68,6 +88,7 @@ async def load_model():
     except Exception as e:
         print(f"❌ SAM-3D 模型載入失敗: {str(e)}")
         raise RuntimeError(f"SAM-3D 模型載入失敗: {str(e)}")
+    asyncio.create_task(_output_cleanup_loop())
 
 
 def load_image(path):
@@ -123,12 +144,14 @@ async def generate_3d(
         
         glb_path = os.path.join(work_dir, "output.glb")
         output["glb"].export(glb_path)
-        
+
+        _output_registry[request_id] = time.time()
+
         return {
             "request_id": request_id,
-            "glb_file": f"/download/{request_id}/output.glb"
+            "glb_file": f"/download/{request_id}/output.glb",
         }
-        
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -141,81 +164,95 @@ async def generate_batch(
 ):
     """
     從原圖 + 多張去背圖批次生成多個 3D 模型
-    
-    ** 更新: 已加入位置修正功能 (Official Fix) **
-    - 套用座標轉換 (Y-Up -> Z-Up)
-    - 套用預測的 Scale/Rotation/Translation
+
+    HTTP status:
+      200 — all masks succeeded
+      207 — partial success
+      503 — model not loaded
+      500 — all masks failed
     """
     global inference
-    
+
     if inference is None:
         raise HTTPException(status_code=503, detail="模型尚未載入")
-    
+
+    request_id = str(uuid.uuid4())
+    print(f"SAM-3D 批次請求 ID: {request_id}, 共 {len(mask_images)} 個 masks")
+
+    work_dir = os.path.join(OUTPUT_DIR, request_id)
+    os.makedirs(work_dir, exist_ok=True)
+
     try:
-        request_id = str(uuid.uuid4())
-        print(f"SAM-3D 批次請求 ID: {request_id}, 共 {len(mask_images)} 個 masks")
-        
-        work_dir = os.path.join(OUTPUT_DIR, request_id)
-        os.makedirs(work_dir, exist_ok=True)
-        
         image_path = os.path.join(work_dir, "image.png")
         with open(image_path, "wb") as buffer:
             shutil.copyfileobj(image.file, buffer)
-        
+
         img = load_image(image_path)
-        
-        masks = []
+
+        results = []
+
         for i, mask_file in enumerate(mask_images):
             mask_path = os.path.join(work_dir, f"{i}.png")
             with open(mask_path, "wb") as buffer:
                 shutil.copyfileobj(mask_file.file, buffer)
-            masks.append(load_mask(mask_path))
-        
-        # 1. 執行推論
-        outputs = [inference(img, mask, seed=seed) for mask in masks]
-        
-        glb_files = []
-        
-        # 2. 應用座標轉換與變形 (Official Fix Logic)
-        for i, output in enumerate(outputs):
-            # A. Copy the raw mesh
-            mesh = output["glb"].copy()
-            
-            # B. Coordinate Conversion (Y-Up to Z-Up)
-            # The raw GLB from inference is Y-Up, but predicted params are Z-Up.
-            vertices = mesh.vertices.astype(np.float32) @ _R_YUP_TO_ZUP
-            
-            # Ensure tensor is on correct device
-            device = output["rotation"].device
-            vertices_tensor = torch.from_numpy(vertices).float().to(device)
-            
-            # C. Prepare Transformation Matrix
-            R_l2c = quaternion_to_matrix(output["rotation"])
-            
-            l2c_transform = compose_transform(
-                scale=output["scale"],
-                rotation=R_l2c,
-                translation=output["translation"],
-            )
-            
-            # D. Apply Transformation
-            vertices_transformed = l2c_transform.transform_points(vertices_tensor.unsqueeze(0))
-            vertices_final = vertices_transformed.squeeze(0).cpu().numpy()
-            
-            # E. Update Mesh Vertices
-            mesh.vertices = vertices_final
-            
-            # F. Export
-            glb_path = os.path.join(work_dir, f"output_{i}.glb")
-            mesh.export(glb_path)
-            glb_files.append(f"/download/{request_id}/output_{i}.glb")
-        
-        return {
+
+            try:
+                mask = load_mask(mask_path)
+                output = inference(img, mask, seed=seed)
+
+                mesh = output["glb"].copy()
+                vertices = mesh.vertices.astype(np.float32) @ _R_YUP_TO_ZUP
+
+                device = output["rotation"].device
+                vertices_tensor = torch.from_numpy(vertices).float().to(device)
+
+                R_l2c = quaternion_to_matrix(output["rotation"])
+                l2c_transform = compose_transform(
+                    scale=output["scale"],
+                    rotation=R_l2c,
+                    translation=output["translation"],
+                )
+                vertices_transformed = l2c_transform.transform_points(vertices_tensor.unsqueeze(0))
+                mesh.vertices = vertices_transformed.squeeze(0).cpu().numpy()
+
+                glb_path = os.path.join(work_dir, f"output_{i}.glb")
+                mesh.export(glb_path)
+
+                results.append({
+                    "mask_index": i,
+                    "status": "success",
+                    "glb_file": f"/download/{request_id}/output_{i}.glb",
+                })
+
+            except Exception as e:
+                print(f"  ❌ mask {i} failed: {e}")
+                results.append({
+                    "mask_index": i,
+                    "status": "failed",
+                    "error": str(e),
+                })
+
+        _output_registry[request_id] = time.time()
+
+        succeeded = sum(1 for r in results if r["status"] == "success")
+        failed = len(results) - succeeded
+
+        response_body = {
             "request_id": request_id,
-            "count": len(glb_files),
-            "glb_files": glb_files
+            "total": len(mask_images),
+            "succeeded": succeeded,
+            "failed": failed,
+            "results": results,
         }
-        
+
+        if succeeded == 0:
+            raise HTTPException(status_code=500, detail=f"All {len(mask_images)} masks failed. See 'results' for per-mask errors.")
+
+        status_code = 207 if failed > 0 else 200
+        return JSONResponse(content=response_body, status_code=status_code)
+
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"Batch generation error: {e}")
         raise HTTPException(status_code=500, detail=str(e))

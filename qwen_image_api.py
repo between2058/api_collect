@@ -16,7 +16,7 @@ from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.concurrency import run_in_threadpool
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 # --- Diffusers Imports ---
 from diffusers import QwenImagePipeline, QwenImageEditPlusPipeline
@@ -74,6 +74,16 @@ def build_angle_prompt(azimuth: float, elevation: float = 0.0, distance: float =
     dist_snap = snap_to_nearest(distance, list(DISTANCE_MAP.keys()))
     return f"<sks> {AZIMUTH_MAP[az_snap]} {ELEVATION_MAP[el_snap]} {DISTANCE_MAP[dist_snap]}"
 
+SUPPORTED_IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.webp', '.bmp', '.tiff'}
+
+def _validate_image_upload(file: UploadFile, field_name: str = "file"):
+    ext = os.path.splitext(file.filename or '')[1].lower()
+    if ext not in SUPPORTED_IMAGE_EXTENSIONS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unsupported image type '{ext}' for field '{field_name}'. Must be one of: {sorted(SUPPORTED_IMAGE_EXTENSIONS)}",
+        )
+
 # Text2Image 的比例設定
 ASPECT_RATIOS = {
     "1:1": (1328, 1328), "16:9": (1664, 928), "9:16": (928, 1664),
@@ -87,7 +97,17 @@ class Text2ImgRequest(BaseModel):
     aspect_ratio: str = "16:9"  # Keys in ASPECT_RATIOS
     num_steps: int = 50
     cfg_scale: float = 4.0
-    seed: int = 42
+    seed: int = Field(default_factory=lambda: random.randint(0, MAX_SEED))
+    num_samples: int = 1  # 生成張數，每張使用獨立隨機 seed
+
+@app.get("/health")
+async def health_check():
+    return {
+        "status": "ok",
+        "device": DEVICE,
+        "gpu_busy": gpu_lock.locked(),
+    }
+
 
 # ==========================================
 # MODEL 1: Text-to-Image (Text -> Image)
@@ -103,8 +123,18 @@ async def text_to_image(req: Text2ImgRequest):
     req_dir = os.path.join(OUTPUT_DIR, request_id)
     os.makedirs(req_dir, exist_ok=True)
 
-    width, height = ASPECT_RATIOS.get(req.aspect_ratio, (1024, 1024))
-    print(f"📝 [Text2Img] ID: {request_id} | Prompt: {req.prompt[:50]}... | Size: {width}x{height}")
+    if req.aspect_ratio not in ASPECT_RATIOS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid aspect_ratio '{req.aspect_ratio}'. Must be one of: {list(ASPECT_RATIOS.keys())}",
+        )
+    if not (1 <= req.num_samples <= 8):
+        raise HTTPException(
+            status_code=422,
+            detail="num_samples must be between 1 and 8",
+        )
+    width, height = ASPECT_RATIOS[req.aspect_ratio]
+    print(f"📝 [Text2Img] ID: {request_id} | Prompt: {req.prompt[:50]}... | Size: {width}x{height} | Samples: {req.num_samples}")
 
     async with gpu_lock:
         def run_inference():
@@ -115,32 +145,37 @@ async def text_to_image(req: Text2ImgRequest):
                     "Qwen/Qwen-Image-2512",
                     torch_dtype=DTYPE
                 ).to(DEVICE)
-                
-                generator = torch.Generator(device=DEVICE).manual_seed(req.seed)
-                
-                print("🚀 Generating image...")
-                image = pipe(
-                    prompt=req.prompt,
-                    negative_prompt=req.negative_prompt,
-                    width=width,
-                    height=height,
-                    num_inference_steps=req.num_steps,
-                    true_cfg_scale=req.cfg_scale,
-                    generator=generator
-                ).images[0]
-                
-                path = save_image(image, req_dir, "output.png")
-                return path
+
+                seeds = [random.randint(0, MAX_SEED) for _ in range(req.num_samples)]
+                paths = []
+                for i, seed_i in enumerate(seeds):
+                    generator = torch.Generator(device=DEVICE).manual_seed(seed_i)
+                    print(f"🚀 Generating image {i+1}/{req.num_samples} (seed={seed_i})...")
+                    image = pipe(
+                        prompt=req.prompt,
+                        negative_prompt=req.negative_prompt,
+                        width=width,
+                        height=height,
+                        num_inference_steps=req.num_steps,
+                        true_cfg_scale=req.cfg_scale,
+                        generator=generator
+                    ).images[0]
+                    path = save_image(image, req_dir, f"output_{i}.png")
+                    paths.append(path)
+
+                return paths, seeds
             finally:
                 if pipe: del pipe
                 flush_gpu()
 
         try:
-            output_path = await run_in_threadpool(run_inference)
+            output_paths, used_seeds = await run_in_threadpool(run_inference)
+            urls = [f"/download/{request_id}/output_{i}.png" for i in range(len(output_paths))]
             return {
                 "status": "success",
                 "request_id": request_id,
-                "url": f"/download/{request_id}/output.png"
+                "urls": urls,
+                "seeds": used_seeds
             }
         except Exception as e:
             print(f"❌ Error: {e}")
@@ -156,23 +191,29 @@ async def edit_image(
     prompt: str = Form(..., description="編輯指令"),
     steps: int = Form(40),
     cfg_scale: float = Form(4.0),
-    seed: int = Form(42)
+    seed: int = Form(42),
+    num_samples: int = Form(1)
 ):
     """
     [Model 2] Qwen-Image-Edit-2511 (Base Model)
     輸入: 圖片 + Prompt
     功能: 根據文字指令修改圖片內容
     """
+    _validate_image_upload(file, "file")
+
+    if not (1 <= num_samples <= 8):
+        raise HTTPException(status_code=422, detail="num_samples must be between 1 and 8")
+
     request_id = str(uuid.uuid4())
     req_dir = os.path.join(OUTPUT_DIR, request_id)
     os.makedirs(req_dir, exist_ok=True)
-    
+
     # 儲存上傳圖片
     input_path = os.path.join(req_dir, "input.png")
     with open(input_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
 
-    print(f"🎨 [Edit] ID: {request_id} | Prompt: {prompt}")
+    print(f"🎨 [Edit] ID: {request_id} | Prompt: {prompt} | Samples: {num_samples}")
 
     async with gpu_lock:
         def run_inference():
@@ -183,33 +224,38 @@ async def edit_image(
                     "Qwen/Qwen-Image-Edit-2511",
                     torch_dtype=DTYPE
                 ).to(DEVICE)
-                
+
                 img_obj = Image.open(input_path).convert("RGB")
-                generator = torch.Generator(device=DEVICE).manual_seed(seed)
-                
-                print("🚀 Editing image...")
-                output = pipe(
-                    image=[img_obj],
-                    prompt=prompt,
-                    num_inference_steps=steps,
-                    true_cfg_scale=cfg_scale,
-                    generator=generator,
-                    num_images_per_prompt=1
-                ).images[0]
-                
-                path = save_image(output, req_dir, "result.png")
-                return path
+                seeds = [random.randint(0, MAX_SEED) for _ in range(num_samples)]
+                paths = []
+                for i, seed_i in enumerate(seeds):
+                    generator = torch.Generator(device=DEVICE).manual_seed(seed_i)
+                    print(f"🚀 Editing image {i+1}/{num_samples} (seed={seed_i})...")
+                    output = pipe(
+                        image=[img_obj],
+                        prompt=prompt,
+                        num_inference_steps=steps,
+                        true_cfg_scale=cfg_scale,
+                        generator=generator,
+                        num_images_per_prompt=1
+                    ).images[0]
+                    path = save_image(output, req_dir, f"result_{i}.png")
+                    paths.append(path)
+
+                return paths, seeds
             finally:
                 if pipe: del pipe
                 flush_gpu()
 
         try:
-            output_path = await run_in_threadpool(run_inference)
+            output_paths, used_seeds = await run_in_threadpool(run_inference)
+            result_urls = [f"/download/{request_id}/result_{i}.png" for i in range(len(output_paths))]
             return {
                 "status": "success",
                 "request_id": request_id,
                 "input_url": f"/download/{request_id}/input.png",
-                "result_url": f"/download/{request_id}/result.png"
+                "result_urls": result_urls,
+                "seeds": used_seeds
             }
         except Exception as e:
             print(f"❌ Error: {e}")
@@ -231,6 +277,9 @@ async def edit_multi_images(
     輸入: 多張圖片 + Prompt
     功能: 根據文字指令修改圖片內容
     """
+    for i, f in enumerate(files):
+        _validate_image_upload(f, f"files[{i}]")
+
     request_id = str(uuid.uuid4())
     req_dir = os.path.join(OUTPUT_DIR, request_id)
     os.makedirs(req_dir, exist_ok=True)
@@ -239,7 +288,7 @@ async def edit_multi_images(
 
     input_images_pil = []
     input_urls = []
-    
+
     # 1. 讀取圖片
     for i, file in enumerate(files):
         filename = f"input_{i}.png"
@@ -322,6 +371,14 @@ async def change_angle(
     input_path = os.path.join(req_dir, "input.png")
     with open(input_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
+
+    if mode not in ("custom", "multi"):
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid mode '{mode}'. Must be 'custom' or 'multi'.",
+        )
+
+    _validate_image_upload(file, "file")
 
     print(f"🔄 [Angle] ID: {request_id} | Mode: {mode}")
 

@@ -22,7 +22,9 @@ from fastapi.concurrency import run_in_threadpool
 from trellis.pipelines import TrellisVGGTTo3DPipeline
 from trellis.utils import render_utils, postprocessing_utils
 
-app = FastAPI()
+VALID_MULTIIMAGE_ALGOS = {'multidiffusion', 'stochastic'}
+
+app = FastAPI(title="ReconViaGen API")
 
 app.add_middleware(
     CORSMiddleware,
@@ -62,6 +64,15 @@ def ensure_model_loaded():
     else:
         # 模型已經在記憶體中，直接略過
         pass
+
+@app.get("/health")
+async def health_check():
+    return {
+        "status": "ok",
+        "model_loaded": pipeline is not None,
+        "gpu_busy": gpu_lock.locked(),
+    }
+
 
 @app.post("/generate-single")
 async def generate_single_image(
@@ -114,38 +125,39 @@ async def generate_batch_images(
     """
     Batch Mode:
     接收多張不同圖片，依序對每張圖片執行 Single Image Inference。
+
+    HTTP status:
+      200 — all items succeeded
+      207 — partial success (some failed, some succeeded)
+      400 — no files uploaded
+      500 — all items failed
     """
+    if len(files) < 1:
+        raise HTTPException(status_code=400, detail="請至少上傳一張圖片")
+
+    batch_results = []
+    print(f"📦 [Batch Start] 收到 {len(files)} 張圖片，準備排隊處理...")
+
     try:
-        if len(files) < 1:
-            raise HTTPException(status_code=400, detail="請至少上傳一張圖片")
-
-        batch_results = []
-        print(f"📦 [Batch Start] 收到 {len(files)} 張圖片，準備排隊處理...")
-
         for i, file in enumerate(files):
             # 1. 準備獨立的 ID 與目錄
             request_id = f"{uuid.uuid4()}_batch_{i}"
             req_dir = os.path.join(OUTPUT_DIR, request_id)
             os.makedirs(req_dir, exist_ok=True)
-            
+
             print(f"  👉 [{i+1}/{len(files)}] 正在處理: {file.filename}")
 
             # 2. 儲存並讀取圖片
             input_path = os.path.join(req_dir, "input.png")
-            
-            # 因為 file.file 是一個指針，讀取後游標會到底，
-            # 若為了安全起見，這裡直接寫入 buffer
             with open(input_path, "wb") as buffer:
                 shutil.copyfileobj(file.file, buffer)
-            
+
             image = Image.open(input_path)
 
             # 3. 呼叫現有的 Pipeline
-            # 注意：這裡 images=[image]，也就是當作 Single Image 來跑
-            # 由於 _run_pipeline 有 gpu_lock，這裡會自動等待上一張跑完才開始
             try:
                 result = await _run_pipeline(
-                    images=[image], 
+                    images=[image],
                     request_id=request_id,
                     seed=seed,
                     simplify=simplify,
@@ -154,14 +166,13 @@ async def generate_batch_images(
                     ss_sampling_steps=ss_sampling_steps,
                     slat_guidance_strength=slat_guidance_strength,
                     slat_sampling_steps=slat_sampling_steps,
-                    multiimage_algo="stochastic" # 單張圖模式固定用 stochastic
+                    multiimage_algo="stochastic"
                 )
-                
-                # 附加原始檔名，方便前端對應
+
                 result["original_filename"] = file.filename
                 result["status"] = "success"
                 batch_results.append(result)
-                
+
             except Exception as e:
                 print(f"  ❌ [{file.filename}] 處理失敗: {e}")
                 batch_results.append({
@@ -169,14 +180,31 @@ async def generate_batch_images(
                     "status": "failed",
                     "error": str(e)
                 })
-        
+
         print(f"✅ [Batch End] 所有任務處理完成。")
-        
-        return {
+
+        succeeded = sum(1 for r in batch_results if r.get("status") == "success")
+        failed = len(batch_results) - succeeded
+
+        response_body = {
             "total_count": len(files),
-            "results": batch_results
+            "succeeded": succeeded,
+            "failed": failed,
+            "results": batch_results,
         }
 
+        if succeeded == 0:
+            raise HTTPException(
+                status_code=500,
+                detail=f"All {len(files)} items failed. See 'results' for per-item errors.",
+            )
+
+        from fastapi.responses import JSONResponse
+        status_code = 207 if failed > 0 else 200
+        return JSONResponse(content=response_body, status_code=status_code)
+
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"❌ Batch Critical Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -195,6 +223,12 @@ async def generate_multi_image(
     slat_sampling_steps: int = 12,
     multiimage_algo: str = "multidiffusion"
 ):
+    if multiimage_algo not in VALID_MULTIIMAGE_ALGOS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid multiimage_algo '{multiimage_algo}'. Must be one of: {sorted(VALID_MULTIIMAGE_ALGOS)}",
+        )
+
     try:
         if len(files) < 1:
             raise HTTPException(status_code=400, detail="請至少上傳一張圖片")
@@ -202,14 +236,14 @@ async def generate_multi_image(
         request_id = str(uuid.uuid4())
         req_dir = os.path.join(OUTPUT_DIR, request_id)
         os.makedirs(req_dir, exist_ok=True)
-        
+
         loaded_images = []
         for i, file in enumerate(files):
             file_path = os.path.join(req_dir, f"input_{i}.png")
             with open(file_path, "wb") as buffer:
                 shutil.copyfileobj(file.file, buffer)
             loaded_images.append(Image.open(file_path))
-        
+
         return await _run_pipeline(
             images=loaded_images,
             request_id=request_id,
@@ -222,6 +256,8 @@ async def generate_multi_image(
             slat_sampling_steps=slat_sampling_steps,
             multiimage_algo=multiimage_algo
         )
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

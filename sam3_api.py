@@ -9,10 +9,14 @@ import sys
 import uuid
 import shutil
 import tempfile
+import time
+import asyncio
 import numpy as np
 from PIL import Image
 from typing import List, Optional
 import json
+
+SESSION_TTL_SECONDS = 60 * 60  # sessions expire after 1 hour
 
 app = FastAPI(title="SAM3 API", description="2D Interactive Segmentation using SAM3")
 
@@ -75,6 +79,26 @@ async def load_model():
 
 # 儲存 inference_state 的字典（用於多步驟互動）
 inference_states = {}
+
+
+async def _session_cleanup_loop():
+    """Background task: remove sessions older than SESSION_TTL_SECONDS."""
+    while True:
+        await asyncio.sleep(10 * 60)  # check every 10 minutes
+        cutoff = time.time() - SESSION_TTL_SECONDS
+        expired = [sid for sid, s in list(inference_states.items()) if s.get('created_at', 0) < cutoff]
+        for sid in expired:
+            session = inference_states.pop(sid, None)
+            if session:
+                work_dir = os.path.dirname(session.get('image_path', ''))
+                if work_dir and os.path.isdir(work_dir):
+                    shutil.rmtree(work_dir, ignore_errors=True)
+                print(f"🧹 Expired session removed: {sid}")
+
+
+@app.on_event("startup")
+async def start_cleanup_task():
+    asyncio.create_task(_session_cleanup_loop())
 
 
 @app.post("/set_image")
@@ -141,13 +165,15 @@ async def set_image(image: UploadFile = File(..., description="要分割的圖�
             "state": inference_state,
             "image_path": image_path,
             "image_size": pil_image.size,  # (width, height)
-            "last_logits": None
+            "last_logits": None,
+            "created_at": time.time(),
         }
 
         return {
             "session_id": session_id,
             "image_size": {"width": pil_image.size[0], "height": pil_image.size[1]},
-            "message": "圖片已設定，可以開始分割"
+            "expires_in_seconds": SESSION_TTL_SECONDS,
+            "message": "圖片已設定，可以開始分割",
         }
 
     except Exception as e:
@@ -178,6 +204,12 @@ async def predict(
     if session_id not in inference_states:
         raise HTTPException(status_code=404, detail="Session 不存在，請先呼叫 /set_image")
 
+    if not point_coords and not box:
+        raise HTTPException(
+            status_code=422,
+            detail="必須提供至少一個提示：point_coords 或 box",
+        )
+
     try:
         session = inference_states[session_id]
         inference_state = session["state"]
@@ -189,11 +221,25 @@ async def predict(
         mask_input = None
 
         if point_coords:
-            input_point = np.array(json.loads(point_coords))
+            try:
+                input_point = np.array(json.loads(point_coords))
+            except (json.JSONDecodeError, ValueError) as e:
+                raise HTTPException(status_code=422, detail=f"point_coords JSON 格式錯誤: {e}")
         if point_labels:
-            input_label = np.array(json.loads(point_labels))
+            try:
+                input_label = np.array(json.loads(point_labels))
+            except (json.JSONDecodeError, ValueError) as e:
+                raise HTTPException(status_code=422, detail=f"point_labels JSON 格式錯誤: {e}")
+            if input_point is not None and len(input_point) != len(input_label):
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"point_coords 與 point_labels 長度不一致 ({len(input_point)} vs {len(input_label)})",
+                )
         if box:
-            input_box = np.array(json.loads(box))
+            try:
+                input_box = np.array(json.loads(box))
+            except (json.JSONDecodeError, ValueError) as e:
+                raise HTTPException(status_code=422, detail=f"box JSON 格式錯誤: {e}")
 
         # 使用上一次的 mask
         if use_previous_mask and session.get("last_logits") is not None:
@@ -358,7 +404,8 @@ async def health_check():
     return {
         "status": "ok",
         "model_loaded": model is not None,
-        "active_sessions": len(inference_states)
+        "active_sessions": len(inference_states),
+        "session_ttl_seconds": SESSION_TTL_SECONDS,
     }
 
 

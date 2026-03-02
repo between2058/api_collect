@@ -191,7 +191,8 @@ async def edit_image(
     prompt: str = Form(..., description="編輯指令"),
     steps: int = Form(40),
     cfg_scale: float = Form(4.0),
-    seed: int = Form(42)
+    seed: int = Form(42),
+    num_samples: int = Form(1)
 ):
     """
     [Model 2] Qwen-Image-Edit-2511 (Base Model)
@@ -199,6 +200,9 @@ async def edit_image(
     功能: 根據文字指令修改圖片內容
     """
     _validate_image_upload(file, "file")
+
+    if not (1 <= num_samples <= 8):
+        raise HTTPException(status_code=422, detail="num_samples must be between 1 and 8")
 
     request_id = str(uuid.uuid4())
     req_dir = os.path.join(OUTPUT_DIR, request_id)
@@ -209,7 +213,7 @@ async def edit_image(
     with open(input_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
 
-    print(f"🎨 [Edit] ID: {request_id} | Prompt: {prompt}")
+    print(f"🎨 [Edit] ID: {request_id} | Prompt: {prompt} | Samples: {num_samples}")
 
     async with gpu_lock:
         def run_inference():
@@ -220,33 +224,38 @@ async def edit_image(
                     "Qwen/Qwen-Image-Edit-2511",
                     torch_dtype=DTYPE
                 ).to(DEVICE)
-                
+
                 img_obj = Image.open(input_path).convert("RGB")
-                generator = torch.Generator(device=DEVICE).manual_seed(seed)
-                
-                print("🚀 Editing image...")
-                output = pipe(
-                    image=[img_obj],
-                    prompt=prompt,
-                    num_inference_steps=steps,
-                    true_cfg_scale=cfg_scale,
-                    generator=generator,
-                    num_images_per_prompt=1
-                ).images[0]
-                
-                path = save_image(output, req_dir, "result.png")
-                return path
+                seeds = [random.randint(0, MAX_SEED) for _ in range(num_samples)]
+                paths = []
+                for i, seed_i in enumerate(seeds):
+                    generator = torch.Generator(device=DEVICE).manual_seed(seed_i)
+                    print(f"🚀 Editing image {i+1}/{num_samples} (seed={seed_i})...")
+                    output = pipe(
+                        image=[img_obj],
+                        prompt=prompt,
+                        num_inference_steps=steps,
+                        true_cfg_scale=cfg_scale,
+                        generator=generator,
+                        num_images_per_prompt=1
+                    ).images[0]
+                    path = save_image(output, req_dir, f"result_{i}.png")
+                    paths.append(path)
+
+                return paths, seeds
             finally:
                 if pipe: del pipe
                 flush_gpu()
 
         try:
-            output_path = await run_in_threadpool(run_inference)
+            output_paths, used_seeds = await run_in_threadpool(run_inference)
+            result_urls = [f"/download/{request_id}/result_{i}.png" for i in range(len(output_paths))]
             return {
                 "status": "success",
                 "request_id": request_id,
                 "input_url": f"/download/{request_id}/input.png",
-                "result_url": f"/download/{request_id}/result.png"
+                "result_urls": result_urls,
+                "seeds": used_seeds
             }
         except Exception as e:
             print(f"❌ Error: {e}")

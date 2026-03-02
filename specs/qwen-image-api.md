@@ -127,7 +127,8 @@ Edit an image using a text instruction.
 | `prompt` | `string` (Form) | ✅ | — | Editing instruction (e.g. `"Change the car color to red"`) |
 | `steps` | `integer` (Form) | ❌ | `40` | Diffusion steps |
 | `cfg_scale` | `float` (Form) | ❌ | `4.0` | Guidance scale |
-| `seed` | `integer` (Form) | ❌ | `42` | RNG seed |
+| `seed` | `integer` (Form) | ❌ | `42` | Accepted but ignored — each sample uses its own independent random seed |
+| `num_samples` | `integer` (Form) | ❌ | `1` | Number of result images to generate (`1`–`8`) |
 
 **Success Response** — `200 OK`
 
@@ -136,9 +137,15 @@ Edit an image using a text instruction.
   "status": "success",
   "request_id": "550e8400-e29b-41d4-a716-446655440000",
   "input_url": "/download/550e8400-e29b-41d4-a716-446655440000/input.png",
-  "result_url": "/download/550e8400-e29b-41d4-a716-446655440000/result.png"
+  "result_urls": [
+    "/download/550e8400-e29b-41d4-a716-446655440000/result_0.png",
+    "/download/550e8400-e29b-41d4-a716-446655440000/result_1.png"
+  ],
+  "seeds": [1827364910, 983741200]
 }
 ```
+
+> `result_urls` and `seeds` are parallel arrays — `seeds[i]` is the seed used to generate `result_urls[i]`.
 
 **Error Responses**
 
@@ -146,6 +153,7 @@ Edit an image using a text instruction.
 |---|---|
 | `422` | Missing required form fields |
 | `422` | Unsupported image format |
+| `422` | `num_samples` out of range |
 | `500` | Model load failure / inference failure |
 
 ---

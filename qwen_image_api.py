@@ -306,7 +306,7 @@ async def edit_image(
     steps: int = Form(40),
     cfg_scale: float = Form(4.0),
     seed: int = Form(42),
-    num_samples: int = Form(1)
+    num_samples: int = Form(1, ge=1, le=6, description="生成結果數量（1–6），每張使用獨立隨機 seed")
 ):
     """
     [Model 2] Qwen-Image-Edit-2511 (Base Model)
@@ -314,9 +314,6 @@ async def edit_image(
     功能: 根據文字指令修改圖片內容
     """
     _validate_image_upload(file, "file")
-
-    if not (1 <= num_samples <= 8):
-        raise HTTPException(status_code=422, detail="num_samples must be between 1 and 8")
 
     request_id = str(uuid.uuid4())
     req_dir = os.path.join(OUTPUT_DIR, request_id)

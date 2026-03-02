@@ -154,7 +154,7 @@ Edit an image using a text instruction.
 | `steps` | `integer` (Form) | ❌ | `40` | Diffusion steps |
 | `cfg_scale` | `float` (Form) | ❌ | `4.0` | Guidance scale |
 | `seed` | `integer` (Form) | ❌ | `42` | Accepted but ignored — each sample uses its own independent random seed |
-| `num_samples` | `integer` (Form) | ❌ | `1` | Number of result images to generate (`1`–`8`) |
+| `num_samples` | `integer` (Form) | ❌ | `1` | Number of result images to generate (`1`–`6`) |
 
 **Success Response** — `200 OK`
 
@@ -179,7 +179,7 @@ Edit an image using a text instruction.
 |---|---|---|
 | `422` | Missing required form fields | FastAPI validation error (plain string) |
 | `422` | Unsupported image format | FastAPI validation error (plain string) |
-| `422` | `num_samples` out of range | FastAPI validation error (plain string) |
+| `422` | `num_samples` out of range (must be 1–6) | FastAPI validation error (plain string) |
 | `503` | GPU OOM | `GPU_OOM` |
 | `500` | Unhandled inference exception | `INFERENCE_ERROR` |
 

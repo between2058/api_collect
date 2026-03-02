@@ -7,6 +7,30 @@
 
 ---
 
+## Error Response Format
+
+All non-2xx responses (except `422` FastAPI validation errors and `400`) return a structured JSON body:
+
+```json
+{
+  "detail": {
+    "error_code": "GPU_OOM",
+    "message": "GPU out of memory. Free some VRAM and retry."
+  }
+}
+```
+
+| `error_code` | HTTP | Retryable | Meaning |
+|---|---|---|---|
+| `GPU_OOM` | `503` | ✅ (after delay) | GPU out of memory — `Retry-After: 30` header is included |
+| `MODEL_UNAVAILABLE` | `503` | ✅ (after delay) | Model failed to load |
+| `DISK_FULL` | `507` | ❌ | Server disk full — human intervention required |
+| `INFERENCE_ERROR` | `500` | ❌ | Unhandled inference exception |
+
+> **Log format:** Every error prints to stdout: `❌ [ERROR_CODE] request_id=<uuid> | ExceptionType: message` followed by a full traceback.
+
+---
+
 ## Startup Behaviour
 
 The model is **not** loaded at startup. It is loaded lazily on the first request inside the `gpu_lock`. Subsequent requests reuse the in-memory pipeline.
@@ -15,7 +39,7 @@ The model is **not** loaded at startup. It is loaded lazily on the first request
 ensure_model_loaded()  # called inside gpu_lock at each request
 ```
 
-If model loading fails during the first request, a `500` is returned and `pipeline` stays `None`, so every subsequent request also attempts to load (and fails) until the server is restarted.
+If model loading fails during the first request, a `503 MODEL_UNAVAILABLE` is returned and `pipeline` stays `None`, so every subsequent request also attempts to load (and fails) until the server is restarted.
 
 > **Warning:** These endpoints are synchronous. For large images or complex geometry, inference can take several minutes. Configure HTTP client timeouts accordingly (recommend ≥ 10 minutes).
 
@@ -72,12 +96,13 @@ Generate a 3D model from a single image.
 
 **Error Responses**
 
-| Status | Condition | `detail` |
+| Status | Condition | `error_code` |
 |---|---|---|
-| `422` | Missing `file` | FastAPI validation |
-| `500` | Model load failure | `"Model loading failed: <reason>"` |
-| `500` | Inference failure | `"<exception message>"` |
-| `500` | Output file export failure | `"<exception message>"` |
+| `422` | Missing `file` | FastAPI validation (plain string) |
+| `503` | GPU OOM during model load or inference | `GPU_OOM` |
+| `503` | Model failed to load | `MODEL_UNAVAILABLE` |
+| `507` | Server disk full | `DISK_FULL` |
+| `500` | Unhandled inference / export exception | `INFERENCE_ERROR` |
 
 ---
 
@@ -110,7 +135,8 @@ Process multiple images sequentially, each generating an independent 3D model.
     {
       "original_filename": "chair.png",
       "status": "failed",
-      "error": "<exception message>"
+      "error_code": "GPU_OOM",
+      "error": "GPU out of memory. Free some VRAM and retry."
     }
   ]
 }
@@ -129,11 +155,15 @@ Process multiple images sequentially, each generating an independent 3D model.
 
 **Error Responses**
 
-| Status | Condition | `detail` |
+| Status | Condition | `error_code` / `detail` |
 |---|---|---|
-| `400` | Zero files uploaded | `"請至少上傳一張圖片"` |
-| `500` | All items in batch failed | `"All <N> items failed"` |
-| `500` | Unexpected error outside item loop | `"<exception message>"` |
+| `400` | Zero files uploaded | plain string: `"請至少上傳一張圖片"` |
+| `500` | All items in batch failed | plain string: `"All <N> items failed. See 'results' for per-item errors."` |
+| `503` | Unexpected GPU OOM outside item loop | `GPU_OOM` |
+| `507` | Server disk full | `DISK_FULL` |
+| `500` | Unexpected error outside item loop | `INFERENCE_ERROR` |
+
+> **Per-item errors** in `results[]` now include an `error_code` field alongside `error` for programmatic handling.
 
 ---
 
@@ -155,11 +185,14 @@ Same schema as `/generate-single`.
 
 **Error Responses**
 
-| Status | Condition | `detail` |
+| Status | Condition | `error_code` |
 |---|---|---|
-| `400` | Zero files uploaded | `"請至少上傳一張圖片"` |
-| `422` | Missing `files` field | FastAPI validation |
-| `500` | Model load failure / inference failure | `"<exception message>"` |
+| `400` | Zero files uploaded | plain string: `"請至少上傳一張圖片"` |
+| `422` | Missing `files` field | FastAPI validation (plain string) |
+| `422` | Invalid `multiimage_algo` | FastAPI validation (plain string) |
+| `503` | GPU OOM during model load or inference | `GPU_OOM` |
+| `503` | Model failed to load | `MODEL_UNAVAILABLE` |
+| `500` | Unhandled inference exception | `INFERENCE_ERROR` |
 
 ---
 

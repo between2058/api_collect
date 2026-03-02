@@ -228,24 +228,44 @@ def load_model_instance(
     )
     return model
 
+def classify_exception(e: Exception) -> tuple[int, str, str]:
+    """
+    將例外分類為對應的 HTTP 狀態碼、錯誤代碼與說明。
+    回傳 (status_code, error_code, human_readable_message)
+
+    HTTP status code 語義：
+      503 GPU_OOM           — GPU 記憶體不足，稍後可重試（附 Retry-After header）
+      503 MODEL_UNAVAILABLE — 模型載入失敗或依賴不可用，稍後可重試
+      507 DISK_FULL         — 磁碟空間不足，需人工介入
+      500 INFERENCE_ERROR   — 未知推論錯誤，不可自動重試
+    """
+    if isinstance(e, torch.cuda.OutOfMemoryError):
+        return 503, "GPU_OOM", "GPU out of memory. Free some VRAM and retry."
+    if isinstance(e, RuntimeError) and "out of memory" in str(e).lower():
+        return 503, "GPU_OOM", "GPU out of memory. Free some VRAM and retry."
+    if isinstance(e, RuntimeError) and (
+        "Model loading failed" in str(e) or "class not available" in str(e)
+    ):
+        return 503, "MODEL_UNAVAILABLE", str(e)
+    if isinstance(e, OSError) and getattr(e, "errno", None) == 28:
+        return 507, "DISK_FULL", "Server disk is full. Contact administrator."
+    return 500, "INFERENCE_ERROR", str(e)
+
 def release_model_memory(model):
     """
-    強制釋放模型佔用的 CPU 和 GPU 記憶體
+    強制釋放模型佔用的 CPU 和 GPU 記憶體。
+    即使清理過程本身發生例外也不會向上拋出，確保 finally 區塊不會二次崩潰。
     """
     print("🧹 Cleaning up GPU memory...")
-    
-    # 1. 刪除模型引用
-    del model
-    
-    # 2. 強制執行 Python 垃圾回收
-    gc.collect()
-    
-    # 3. 清空 PyTorch CUDA 快取 (這一步最重要)
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        torch.cuda.ipc_collect() # 有時候這行也有幫助
-        
-    print("✨ GPU memory released.")
+    try:
+        del model
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+        print("✨ GPU memory released.")
+    except Exception as cleanup_err:
+        print(f"⚠️ GPU memory cleanup failed (non-critical): {type(cleanup_err).__name__}: {cleanup_err}")
 
 @app.get("/health")
 async def health_check():
@@ -346,9 +366,15 @@ async def segment_3d(
         }
 
     except Exception as e:
-        print(f"Segmentation Error: {e}")
+        status, error_code, message = classify_exception(e)
+        print(f"❌ [{error_code}] request_id={request_id} | {type(e).__name__}: {e}")
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        headers = {"Retry-After": "30"} if status == 503 else {}
+        raise HTTPException(
+            status_code=status,
+            detail={"error_code": error_code, "message": message},
+            headers=headers,
+        )
         
     finally:
         # 5. 清理資源 (Unload)

@@ -17,6 +17,7 @@ from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
+import traceback
 
 # --- Diffusers Imports ---
 from diffusers import QwenImagePipeline, QwenImageEditPlusPipeline
@@ -50,6 +51,34 @@ def flush_gpu():
     gc.collect()
     torch.cuda.empty_cache()
     print("🧹 GPU Memory Flushed")
+
+def classify_exception(e: Exception) -> tuple[int, str, str]:
+    """
+    將例外分類為對應的 HTTP 狀態碼、錯誤代碼與說明。
+    回傳 (status_code, error_code, human_readable_message)
+
+    HTTP status code 語義：
+      503 GPU_OOM           — GPU 記憶體不足，稍後可重試（附 Retry-After header）
+      503 MODEL_UNAVAILABLE — 模型載入失敗，稍後可重試
+      507 DISK_FULL         — 磁碟空間不足，需人工介入
+      500 INFERENCE_ERROR   — 未知推論錯誤，不可自動重試
+    """
+    # GPU 記憶體不足（PyTorch >= 2.1 的具名例外）
+    if isinstance(e, torch.cuda.OutOfMemoryError):
+        return 503, "GPU_OOM", "GPU out of memory. Free some VRAM and retry."
+    # 舊版 PyTorch OOM（RuntimeError: CUDA out of memory ...）
+    if isinstance(e, RuntimeError) and "out of memory" in str(e).lower():
+        return 503, "GPU_OOM", "GPU out of memory. Free some VRAM and retry."
+    # 模型/依賴不可用
+    if isinstance(e, RuntimeError) and (
+        "Model loading failed" in str(e) or "class not available" in str(e)
+    ):
+        return 503, "MODEL_UNAVAILABLE", str(e)
+    # 磁碟空間不足（ENOSPC errno=28）
+    if isinstance(e, OSError) and getattr(e, "errno", None) == 28:
+        return 507, "DISK_FULL", "Server disk is full. Contact administrator."
+    # 其他未知推論錯誤
+    return 500, "INFERENCE_ERROR", str(e)
 
 def save_image(image: Image.Image, folder: str, filename: str) -> str:
     path = os.path.join(folder, filename)
@@ -178,8 +207,17 @@ async def text_to_image(req: Text2ImgRequest):
                 "seeds": used_seeds
             }
         except Exception as e:
-            print(f"❌ Error: {e}")
-            raise HTTPException(status_code=500, detail=str(e))
+            status, error_code, message = classify_exception(e)
+            print(f"❌ [{error_code}] request_id={request_id} | {type(e).__name__}: {e}")
+            traceback.print_exc()
+            if error_code == "GPU_OOM":
+                flush_gpu()
+            headers = {"Retry-After": "30"} if status == 503 else {}
+            raise HTTPException(
+                status_code=status,
+                detail={"error_code": error_code, "message": message},
+                headers=headers,
+            )
 
 
 # ==========================================
@@ -258,8 +296,17 @@ async def edit_image(
                 "seeds": used_seeds
             }
         except Exception as e:
-            print(f"❌ Error: {e}")
-            raise HTTPException(status_code=500, detail=str(e))
+            status, error_code, message = classify_exception(e)
+            print(f"❌ [{error_code}] request_id={request_id} | {type(e).__name__}: {e}")
+            traceback.print_exc()
+            if error_code == "GPU_OOM":
+                flush_gpu()
+            headers = {"Retry-After": "30"} if status == 503 else {}
+            raise HTTPException(
+                status_code=status,
+                detail={"error_code": error_code, "message": message},
+                headers=headers,
+            )
 
 # ==========================================
 # MODEL 2: Edit Multi (Multiple Images + 1 Prompt)
@@ -344,8 +391,17 @@ async def edit_multi_images(
                 "results": result_urls  # 這裡現在只會包含一張大圖的 URL
             }
         except Exception as e:
-            print(f"❌ Error: {e}")
-            raise HTTPException(status_code=500, detail=str(e))
+            status, error_code, message = classify_exception(e)
+            print(f"❌ [{error_code}] request_id={request_id} | {type(e).__name__}: {e}")
+            traceback.print_exc()
+            if error_code == "GPU_OOM":
+                flush_gpu()
+            headers = {"Retry-After": "30"} if status == 503 else {}
+            raise HTTPException(
+                status_code=status,
+                detail={"error_code": error_code, "message": message},
+                headers=headers,
+            )
 
             
 # ==========================================
@@ -364,13 +420,8 @@ async def change_angle(
     輸入: 圖片 + 角度參數
     功能: 旋轉物體視角 (需載入 LoRA)
     """
-    request_id = str(uuid.uuid4())
-    req_dir = os.path.join(OUTPUT_DIR, request_id)
-    os.makedirs(req_dir, exist_ok=True)
-
-    input_path = os.path.join(req_dir, "input.png")
-    with open(input_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
+    # 先驗證，再建立目錄與寫檔，避免無效請求留下垃圾檔案
+    _validate_image_upload(file, "file")
 
     if mode not in ("custom", "multi"):
         raise HTTPException(
@@ -378,7 +429,13 @@ async def change_angle(
             detail=f"Invalid mode '{mode}'. Must be 'custom' or 'multi'.",
         )
 
-    _validate_image_upload(file, "file")
+    request_id = str(uuid.uuid4())
+    req_dir = os.path.join(OUTPUT_DIR, request_id)
+    os.makedirs(req_dir, exist_ok=True)
+
+    input_path = os.path.join(req_dir, "input.png")
+    with open(input_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
 
     print(f"🔄 [Angle] ID: {request_id} | Mode: {mode}")
 
@@ -454,8 +511,17 @@ async def change_angle(
                 "results": results
             }
         except Exception as e:
-            print(f"❌ Error: {e}")
-            raise HTTPException(status_code=500, detail=str(e))
+            status, error_code, message = classify_exception(e)
+            print(f"❌ [{error_code}] request_id={request_id} | {type(e).__name__}: {e}")
+            traceback.print_exc()
+            if error_code == "GPU_OOM":
+                flush_gpu()
+            headers = {"Retry-After": "30"} if status == 503 else {}
+            raise HTTPException(
+                status_code=status,
+                detail={"error_code": error_code, "message": message},
+                headers=headers,
+            )
 
 
 # --- Common: Download & Cleanup ---

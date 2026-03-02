@@ -8,9 +8,33 @@
 
 ---
 
+## Error Response Format
+
+All non-2xx responses (except `422` FastAPI validation errors) return a structured JSON body:
+
+```json
+{
+  "detail": {
+    "error_code": "GPU_OOM",
+    "message": "GPU out of memory. Free some VRAM and retry."
+  }
+}
+```
+
+| `error_code` | HTTP | Retryable | Meaning |
+|---|---|---|---|
+| `GPU_OOM` | `503` | ✅ (after delay) | GPU out of memory — `Retry-After: 30` header is included |
+| `MODEL_UNAVAILABLE` | `503` | ✅ (after delay) | `AutoMask` import failed or model weights could not load |
+| `DISK_FULL` | `507` | ❌ | Server disk full — human intervention required |
+| `INFERENCE_ERROR` | `500` | ❌ | Unhandled inference exception |
+
+> **Log format:** Every error prints to stdout: `❌ [ERROR_CODE] request_id=<uuid> | ExceptionType: message` followed by a full traceback.
+
+---
+
 ## Startup Behaviour
 
-The model is **not** pre-loaded at startup. It is instantiated per-request inside the endpoint handler and released in `finally`. If the `auto_mask` package is unavailable, `AutoMask` is set to `None` and every `/segment` call returns `500`.
+The model is **not** pre-loaded at startup. It is instantiated per-request inside the endpoint handler and released in `finally`. If the `auto_mask` package is unavailable, `AutoMask` is set to `None` and every `/segment` call returns `503 MODEL_UNAVAILABLE`.
 
 ---
 
@@ -83,19 +107,20 @@ Run P3-SAM automatic 3D segmentation on a mesh file. Returns a colour-coded GLB 
 
 **Error Responses**
 
-| Status | Condition | `detail` example |
+| Status | Condition | `error_code` |
 |---|---|---|
-| `422` | Unsupported mesh format | `"Unsupported file type '.fbx'. Must be one of: ..."` |
-| `422` | `point_num` out of range | `"point_num must be between 1000 and 500000"` |
-| `422` | `prompt_num` out of range | `"prompt_num must be between 10 and 1000"` |
-| `422` | `threshold` out of range | `"threshold must be between 0.0 and 1.0"` |
-| `422` | `prompt_bs` out of range | `"prompt_bs must be between 1 and 400"` |
-| `500` | `AutoMask` import failed (missing dependency) | `"AutoMask class not available."` |
-| `500` | Model weight load failed | `"<traceback message>"` |
-| `500` | Trimesh cannot parse uploaded file | `"<trimesh error>"` |
-| `500` | Any other unhandled exception | `"<exception message>"` |
+| `422` | Unsupported mesh format | FastAPI validation (plain string) |
+| `422` | `point_num` out of range | FastAPI validation (plain string) |
+| `422` | `prompt_num` out of range | FastAPI validation (plain string) |
+| `422` | `threshold` out of range | FastAPI validation (plain string) |
+| `422` | `prompt_bs` out of range | FastAPI validation (plain string) |
+| `503` | `AutoMask` import failed (missing dependency) | `MODEL_UNAVAILABLE` |
+| `503` | GPU OOM during model load or inference | `GPU_OOM` |
+| `507` | Server disk full | `DISK_FULL` |
+| `500` | Trimesh cannot parse uploaded file | `INFERENCE_ERROR` |
+| `500` | Any other unhandled exception | `INFERENCE_ERROR` |
 
-> **Note:** A full traceback is printed to stdout on every `500`. Examine server logs for root cause.
+> **Note:** A full traceback is printed to stdout on every error. Log format: `❌ [ERROR_CODE] request_id=<uuid> | ExceptionType: message`.
 
 ---
 

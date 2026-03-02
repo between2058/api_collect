@@ -10,6 +10,30 @@
 
 ---
 
+## Error Response Format
+
+All non-2xx responses (except `422` FastAPI validation errors) return a structured JSON body:
+
+```json
+{
+  "detail": {
+    "error_code": "GPU_OOM",
+    "message": "GPU out of memory. Free some VRAM and retry."
+  }
+}
+```
+
+| `error_code` | HTTP | Retryable | Meaning |
+|---|---|---|---|
+| `GPU_OOM` | `503` | ✅ (after delay) | GPU out of memory — `Retry-After: 30` header is included |
+| `MODEL_UNAVAILABLE` | `503` | ✅ (after delay) | Model failed to load |
+| `DISK_FULL` | `507` | ❌ | Server disk full — human intervention required |
+| `INFERENCE_ERROR` | `500` | ❌ | Unhandled inference exception |
+
+> **Log format:** Every error prints to stdout: `❌ [ERROR_CODE] request_id=<uuid> | ExceptionType: message` followed by a full traceback.
+
+---
+
 ## Startup Behaviour
 
 No model is pre-loaded. Each endpoint loads the required model into GPU, runs inference, then deletes the pipeline and calls `torch.cuda.empty_cache()` in `finally`.
@@ -105,13 +129,15 @@ Generate one or more images from a text prompt.
 
 **Error Responses**
 
-| Status | Condition | `detail` example |
+| Status | Condition | `error_code` |
 |---|---|---|
-| `422` | Missing required `prompt` | FastAPI validation error |
-| `422` | Invalid `aspect_ratio` | `"Invalid aspect_ratio '21:9'. Must be one of: ..."` |
-| `422` | `num_samples` out of range | `"num_samples must be between 1 and 8"` |
-| `500` | Model load failure (OOM, network, etc.) | `"<exception message>"` |
-| `500` | Inference failure | `"<exception message>"` |
+| `422` | Missing required `prompt` | FastAPI validation error (plain string) |
+| `422` | Invalid `aspect_ratio` | FastAPI validation error (plain string) |
+| `422` | `num_samples` out of range | FastAPI validation error (plain string) |
+| `503` | GPU OOM during model load or inference | `GPU_OOM` |
+| `503` | Model failed to load | `MODEL_UNAVAILABLE` |
+| `507` | Server disk full | `DISK_FULL` |
+| `500` | Unhandled inference exception | `INFERENCE_ERROR` |
 
 ---
 
@@ -149,12 +175,13 @@ Edit an image using a text instruction.
 
 **Error Responses**
 
-| Status | Condition |
-|---|---|
-| `422` | Missing required form fields |
-| `422` | Unsupported image format |
-| `422` | `num_samples` out of range |
-| `500` | Model load failure / inference failure |
+| Status | Condition | `error_code` |
+|---|---|---|
+| `422` | Missing required form fields | FastAPI validation error (plain string) |
+| `422` | Unsupported image format | FastAPI validation error (plain string) |
+| `422` | `num_samples` out of range | FastAPI validation error (plain string) |
+| `503` | GPU OOM | `GPU_OOM` |
+| `500` | Unhandled inference exception | `INFERENCE_ERROR` |
 
 ---
 
@@ -194,11 +221,12 @@ Edit multiple images together using a single prompt. The model receives all imag
 
 **Error Responses**
 
-| Status | Condition |
-|---|---|
-| `422` | Missing required form fields |
-| `422` | Any file has an unsupported image format |
-| `500` | Model load failure / inference failure |
+| Status | Condition | `error_code` |
+|---|---|---|
+| `422` | Missing required form fields | FastAPI validation error (plain string) |
+| `422` | Any file has an unsupported image format | FastAPI validation error (plain string) |
+| `503` | GPU OOM | `GPU_OOM` |
+| `500` | Unhandled inference exception | `INFERENCE_ERROR` |
 
 ---
 
@@ -262,12 +290,15 @@ Both adapters are set with `adapter_weights=[1.0, 1.0]` and inference runs with 
 
 **Error Responses**
 
-| Status | Condition |
-|---|---|
-| `422` | Missing required `file` |
-| `422` | Unsupported image format |
-| `422` | Invalid `mode` (not `"custom"` or `"multi"`) |
-| `500` | LoRA load failure / model failure / inference failure |
+> **Validation order:** File format and `mode` are validated **before** any disk I/O or GPU work. Invalid requests are rejected immediately without creating temp directories.
+
+| Status | Condition | `error_code` |
+|---|---|---|
+| `422` | Missing required `file` | FastAPI validation error (plain string) |
+| `422` | Unsupported image format | FastAPI validation error (plain string) |
+| `422` | Invalid `mode` (not `"custom"` or `"multi"`) | FastAPI validation error (plain string) |
+| `503` | GPU OOM during LoRA load or inference | `GPU_OOM` |
+| `500` | Unhandled inference exception | `INFERENCE_ERROR` |
 
 ---
 

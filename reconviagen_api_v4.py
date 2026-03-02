@@ -3,6 +3,7 @@ import shutil
 import tempfile
 import uuid
 import gc
+import traceback
 import asyncio
 import torch
 import numpy as np
@@ -23,6 +24,35 @@ from trellis.pipelines import TrellisVGGTTo3DPipeline
 from trellis.utils import render_utils, postprocessing_utils
 
 VALID_MULTIIMAGE_ALGOS = {'multidiffusion', 'stochastic'}
+
+def flush_gpu():
+    """強制清理 GPU 記憶體"""
+    gc.collect()
+    torch.cuda.empty_cache()
+    print("🧹 GPU Memory Flushed")
+
+def classify_exception(e: Exception) -> tuple[int, str, str]:
+    """
+    將例外分類為對應的 HTTP 狀態碼、錯誤代碼與說明。
+    回傳 (status_code, error_code, human_readable_message)
+
+    HTTP status code 語義：
+      503 GPU_OOM           — GPU 記憶體不足，稍後可重試（附 Retry-After header）
+      503 MODEL_UNAVAILABLE — 模型載入失敗，稍後可重試
+      507 DISK_FULL         — 磁碟空間不足，需人工介入
+      500 INFERENCE_ERROR   — 未知推論錯誤，不可自動重試
+    """
+    if isinstance(e, torch.cuda.OutOfMemoryError):
+        return 503, "GPU_OOM", "GPU out of memory. Free some VRAM and retry."
+    if isinstance(e, RuntimeError) and "out of memory" in str(e).lower():
+        return 503, "GPU_OOM", "GPU out of memory. Free some VRAM and retry."
+    if isinstance(e, RuntimeError) and (
+        "Model loading failed" in str(e) or "class not available" in str(e)
+    ):
+        return 503, "MODEL_UNAVAILABLE", str(e)
+    if isinstance(e, OSError) and getattr(e, "errno", None) == 28:
+        return 507, "DISK_FULL", "Server disk is full. Contact administrator."
+    return 500, "INFERENCE_ERROR", str(e)
 
 app = FastAPI(title="ReconViaGen API")
 
@@ -59,8 +89,9 @@ def ensure_model_loaded():
             pipeline = loaded_pipeline
             print("✅ [Lazy Load] 模型載入完成！")
         except Exception as e:
-            print(f"❌ 模型載入失敗: {e}")
-            raise RuntimeError(f"Model loading failed: {e}")
+            print(f"❌ [MODEL_UNAVAILABLE] 模型載入失敗 | {type(e).__name__}: {e}")
+            traceback.print_exc()
+            raise RuntimeError(f"Model loading failed: {e}") from e
     else:
         # 模型已經在記憶體中，直接略過
         pass
@@ -109,7 +140,15 @@ async def generate_single_image(
             multiimage_algo="stochastic"
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        status, error_code, message = classify_exception(e)
+        print(f"❌ [{error_code}] generate-single | {type(e).__name__}: {e}")
+        traceback.print_exc()
+        headers = {"Retry-After": "30"} if status == 503 else {}
+        raise HTTPException(
+            status_code=status,
+            detail={"error_code": error_code, "message": message},
+            headers=headers,
+        )
 
 @app.post("/generate-batch")
 async def generate_batch_images(
@@ -174,11 +213,14 @@ async def generate_batch_images(
                 batch_results.append(result)
 
             except Exception as e:
-                print(f"  ❌ [{file.filename}] 處理失敗: {e}")
+                status, error_code, message = classify_exception(e)
+                print(f"  ❌ [{error_code}] file={file.filename} | {type(e).__name__}: {e}")
+                traceback.print_exc()
                 batch_results.append({
                     "original_filename": file.filename,
                     "status": "failed",
-                    "error": str(e)
+                    "error_code": error_code,
+                    "error": message,
                 })
 
         print(f"✅ [Batch End] 所有任務處理完成。")
@@ -206,8 +248,15 @@ async def generate_batch_images(
     except HTTPException:
         raise
     except Exception as e:
-        print(f"❌ Batch Critical Error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        status, error_code, message = classify_exception(e)
+        print(f"❌ [{error_code}] generate-batch critical | {type(e).__name__}: {e}")
+        traceback.print_exc()
+        headers = {"Retry-After": "30"} if status == 503 else {}
+        raise HTTPException(
+            status_code=status,
+            detail={"error_code": error_code, "message": message},
+            headers=headers,
+        )
 
 
 
@@ -259,7 +308,15 @@ async def generate_multi_image(
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        status, error_code, message = classify_exception(e)
+        print(f"❌ [{error_code}] generate-multi | {type(e).__name__}: {e}")
+        traceback.print_exc()
+        headers = {"Retry-After": "30"} if status == 503 else {}
+        raise HTTPException(
+            status_code=status,
+            detail={"error_code": error_code, "message": message},
+            headers=headers,
+        )
 
 async def _run_pipeline(
     images, request_id, seed, simplify, texture_size,
@@ -346,8 +403,12 @@ async def _run_pipeline(
             }
 
         except Exception as e:
-            print(f"❌ Error: {e}")
-            raise e
+            status, error_code, message = classify_exception(e)
+            print(f"❌ [{error_code}] request_id={request_id} | {type(e).__name__}: {e}")
+            traceback.print_exc()
+            if error_code == "GPU_OOM":
+                flush_gpu()
+            raise
         
         # [選項] 如果你想在每次推理完後完全釋放模型以節省 VRAM，
         # 請取消註解以下 finally 區塊 (這會導致下一次請求變慢)：

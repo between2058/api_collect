@@ -192,7 +192,12 @@ SUPPORTED_MESH_EXTENSIONS = {'.glb', '.ply', '.obj'}
 
 # 注意：我們移除了全域變數 auto_mask_model，因為我们要每次請求都重新建立並銷毀
 
-def load_model_instance():
+def load_model_instance(
+    point_num: int = 100000,
+    prompt_num: int = 400,
+    threshold: float = 0.95,
+    post_process: bool = True,
+):
     """
     每次呼叫時建立一個新的模型實例
     """
@@ -200,14 +205,14 @@ def load_model_instance():
         raise RuntimeError("AutoMask class not available.")
 
     ckpt_path = None # Set your checkpoint path here
-    
-    print(f"🔄 Loading P3SAM model from {ckpt_path}...")
+
+    print(f"🔄 Loading P3SAM model (point_num={point_num}, prompt_num={prompt_num}, threshold={threshold}, post_process={post_process})...")
     model = AutoMask(
         ckpt_path=ckpt_path,
-        point_num=100000,
-        prompt_num=400,
-        threshold=0.95,
-        post_process=True
+        point_num=point_num,
+        prompt_num=prompt_num,
+        threshold=threshold,
+        post_process=post_process,
     )
     return model
 
@@ -239,14 +244,27 @@ async def health_check():
 
 
 @app.post("/segment")
-async def segment_3d(file: UploadFile = File(...)):
-
+async def segment_3d(
+    file: UploadFile = File(...),
+    point_num: int = Form(100000, description="點雲取樣數量，越大越精確但越慢"),
+    prompt_num: int = Form(400, description="分割 Prompt 數量"),
+    threshold: float = Form(0.95, description="分割信心閾值 (0.0–1.0)"),
+    post_process: bool = Form(True, description="是否套用後處理"),
+    clean_mesh: bool = Form(True, description="推論前是否清理 Mesh"),
+):
     ext = os.path.splitext(file.filename or '')[1].lower()
     if ext not in SUPPORTED_MESH_EXTENSIONS:
         raise HTTPException(
             status_code=422,
             detail=f"Unsupported file type '{ext}'. Must be one of: {sorted(SUPPORTED_MESH_EXTENSIONS)}",
         )
+
+    if not (1000 <= point_num <= 500000):
+        raise HTTPException(status_code=422, detail="point_num must be between 1000 and 500000")
+    if not (10 <= prompt_num <= 1000):
+        raise HTTPException(status_code=422, detail="prompt_num must be between 10 and 1000")
+    if not (0.0 <= threshold <= 1.0):
+        raise HTTPException(status_code=422, detail="threshold must be between 0.0 and 1.0")
 
     model = None # 初始化變數以便 finally 區塊存取
 
@@ -262,13 +280,17 @@ async def segment_3d(file: UploadFile = File(...)):
         # 1. 儲存檔案
         with open(input_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
-        
+
         # 2. 載入 Mesh
         mesh = trimesh.load(input_path, force='mesh')
 
         # 3. 載入模型 (Load)
-        # 這裡會花費時間載入權重到 GPU
-        model = load_model_instance()
+        model = load_model_instance(
+            point_num=point_num,
+            prompt_num=prompt_num,
+            threshold=threshold,
+            post_process=post_process,
+        )
 
         # 4. 執行預測 (Inference)
         print("✅ P3SAM model Start do segmentation.")
@@ -276,9 +298,9 @@ async def segment_3d(file: UploadFile = File(...)):
             model.predict_aabb,
             mesh,
             save_path=job_dir,
-            save_mid_res=False, 
+            save_mid_res=False,
             show_info=True,
-            clean_mesh_flag=True
+            clean_mesh_flag=clean_mesh,
         )
         print("✅ Segmentation Done")
 

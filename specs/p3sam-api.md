@@ -21,9 +21,22 @@ Run P3-SAM automatic 3D segmentation on a mesh file.
 
 **Request** — `multipart/form-data`
 
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `file` | `UploadFile` | ✅ | Input mesh. Supported formats: `.glb`, `.ply`, `.obj` |
+| Field | Type | Required | Default | Constraints | Description |
+|---|---|---|---|---|---|
+| `file` | `UploadFile` | ✅ | — | `.glb`, `.ply`, `.obj` | Input mesh file |
+| `point_num` | `integer` (Form) | ❌ | `100000` | `1000`–`500000` | Point cloud sampling count — higher = more accurate but slower |
+| `prompt_num` | `integer` (Form) | ❌ | `400` | `10`–`1000` | Number of segmentation prompts |
+| `threshold` | `float` (Form) | ❌ | `0.95` | `0.0`–`1.0` | Confidence threshold for segmentation mask |
+| `post_process` | `boolean` (Form) | ❌ | `true` | — | Apply post-processing to the output mask |
+| `clean_mesh` | `boolean` (Form) | ❌ | `true` | — | Clean the mesh geometry before inference |
+
+**Parameter Guide**
+
+| Parameter | Lower value | Higher value |
+|---|---|---|
+| `point_num` | Faster, less detail | Slower, finer segmentation |
+| `prompt_num` | Fewer segment candidates | More segment candidates |
+| `threshold` | More permissive (more parts) | More conservative (fewer parts) |
 
 **Success Response** — `200 OK`
 
@@ -43,6 +56,10 @@ Run P3-SAM automatic 3D segmentation on a mesh file.
 
 | Status | Condition | `detail` example |
 |---|---|---|
+| `422` | Unsupported mesh format | `"Unsupported file type '.fbx'. Must be one of: ..."` |
+| `422` | `point_num` out of range | `"point_num must be between 1000 and 500000"` |
+| `422` | `prompt_num` out of range | `"prompt_num must be between 10 and 1000"` |
+| `422` | `threshold` out of range | `"threshold must be between 0.0 and 1.0"` |
 | `500` | `AutoMask` import failed (missing dependency) | `"AutoMask class not available."` |
 | `500` | Model weight load failed | `"<traceback message>"` |
 | `500` | Trimesh cannot parse uploaded file | `"<trimesh error>"` |

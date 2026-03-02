@@ -156,18 +156,20 @@
 # if __name__ == "__main__":
 #     uvicorn.run(app, host="0.0.0.0", port=5001)
 import os
+import random
 import shutil
 import tempfile
 import uuid
 import trimesh
 import gc  # 引入 garbage collection
+import numpy as np
 import torch # 引入 torch 以控制顯存
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.concurrency import run_in_threadpool
 import uvicorn
-import traceback 
+import traceback
 
 # Import AutoMask from the provided script
 try:
@@ -191,6 +193,16 @@ OUTPUT_DIR = tempfile.mkdtemp()
 SUPPORTED_MESH_EXTENSIONS = {'.glb', '.ply', '.obj'}
 
 # 注意：我們移除了全域變數 auto_mask_model，因為我们要每次請求都重新建立並銷毀
+
+def set_seed(seed: int):
+    """全局設定所有隨機種子，確保結果可重現"""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
 
 def load_model_instance(
     point_num: int = 100000,
@@ -251,6 +263,8 @@ async def segment_3d(
     threshold: float = Form(0.95, description="分割信心閾值 (0.0–1.0)"),
     post_process: bool = Form(True, description="是否套用後處理"),
     clean_mesh: bool = Form(True, description="推論前是否清理 Mesh"),
+    seed: int = Form(42, description="隨機種子，控制點雲取樣與 Prompt 選取的可重現性"),
+    prompt_bs: int = Form(32, description="Prompt 推理 batch size，越大越快但佔用更多 VRAM"),
 ):
     ext = os.path.splitext(file.filename or '')[1].lower()
     if ext not in SUPPORTED_MESH_EXTENSIONS:
@@ -265,6 +279,8 @@ async def segment_3d(
         raise HTTPException(status_code=422, detail="prompt_num must be between 10 and 1000")
     if not (0.0 <= threshold <= 1.0):
         raise HTTPException(status_code=422, detail="threshold must be between 0.0 and 1.0")
+    if not (1 <= prompt_bs <= 400):
+        raise HTTPException(status_code=422, detail="prompt_bs must be between 1 and 400")
 
     model = None # 初始化變數以便 finally 區塊存取
 
@@ -281,8 +297,8 @@ async def segment_3d(
         with open(input_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
 
-        # 2. 載入 Mesh
-        mesh = trimesh.load(input_path, force='mesh')
+        # 2. 載入 Mesh (process=False 與官方 demo 一致，避免預處理改變結果)
+        mesh = trimesh.load(input_path, force='mesh', process=False)
 
         # 3. 載入模型 (Load)
         model = load_model_instance(
@@ -293,27 +309,40 @@ async def segment_3d(
         )
 
         # 4. 執行預測 (Inference)
+        set_seed(seed)  # 全局設定隨機種子
         print("✅ P3SAM model Start do segmentation.")
-        await run_in_threadpool(
+        aabb, face_ids, final_mesh = await run_in_threadpool(
             model.predict_aabb,
             mesh,
             save_path=job_dir,
             save_mid_res=False,
             show_info=True,
             clean_mesh_flag=clean_mesh,
+            seed=seed,
+            prompt_bs=prompt_bs,
         )
         print("✅ Segmentation Done")
 
-        # 檢查輸出
-        expected_output = os.path.join(job_dir, "auto_mask_mesh_final_parts.glb")
-        if not os.path.exists(expected_output):
-            raise HTTPException(status_code=500, detail="Model finished but output file was not found.")
+        # 5. 根據 face_ids 上色並匯出 GLB
+        unique_ids = np.unique(face_ids)
+        color_map = {
+            i: (np.random.rand(3) * 255).astype(np.uint8)
+            for i in unique_ids if i >= 0
+        }
+        face_colors = np.array(
+            [color_map[fid] if fid >= 0 else [0, 0, 0] for fid in face_ids],
+            dtype=np.uint8,
+        )
+        mesh_out = final_mesh.copy()
+        mesh_out.visual.face_colors = face_colors
+        mesh_out.export(output_glb_path)
 
-        shutil.move(expected_output, output_glb_path)
+        num_parts = int(np.sum(unique_ids >= 0))
 
         return {
             "segmented_glb": f"/download/{request_id}/segmented_output_parts.glb",
-            "request_id": request_id
+            "request_id": request_id,
+            "num_parts": num_parts,
         }
 
     except Exception as e:

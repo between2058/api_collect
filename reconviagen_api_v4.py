@@ -14,7 +14,7 @@ from typing import Literal
 # --- 1. 環境變數設定 (必須在所有 import 之前) ---
 os.environ['SPCONV_ALGO'] = 'native'
 
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.concurrency import run_in_threadpool
@@ -23,7 +23,7 @@ from fastapi.concurrency import run_in_threadpool
 from trellis.pipelines import TrellisVGGTTo3DPipeline
 from trellis.utils import render_utils, postprocessing_utils
 
-VALID_MULTIIMAGE_ALGOS = {'multidiffusion', 'stochastic'}
+# multiimage_algo 的合法值由 Literal 型別在 endpoint 層自動驗證，不再需要手動 set
 
 def flush_gpu():
     """強制清理 GPU 記憶體"""
@@ -145,13 +145,13 @@ async def health_check():
 @app.post("/generate-single", responses=GPU_ERROR_RESPONSES)
 async def generate_single_image(
     file: UploadFile = File(...),
-    seed: int = 0,
-    simplify: float = 0.95,
-    texture_size: int = 1024,
-    ss_guidance_strength: float = 7.5,
-    ss_sampling_steps: int = 30,
-    slat_guidance_strength: float = 3.0,
-    slat_sampling_steps: int = 12,
+    seed: int = Form(0, description="RNG seed"),
+    simplify: float = Form(0.95, ge=0.9, le=0.98, description="Mesh simplification ratio. Lower = fewer faces."),
+    texture_size: int = Form(1024, ge=512, le=2048, description="Texture atlas resolution in pixels. Recommended steps: 512, 1024, 1536, 2048."),
+    ss_guidance_strength: float = Form(7.5, ge=0.0, le=10.0, description="[Stage 1] Sparse structure CFG strength"),
+    ss_sampling_steps: int = Form(30, ge=1, le=50, description="[Stage 1] Sparse structure diffusion steps"),
+    slat_guidance_strength: float = Form(3.0, ge=0.0, le=10.0, description="[Stage 2] Structured latent CFG strength"),
+    slat_sampling_steps: int = Form(12, ge=1, le=50, description="[Stage 2] Structured latent diffusion steps"),
 ):
     try:
         request_id = str(uuid.uuid4())
@@ -194,13 +194,13 @@ async def generate_single_image(
 })
 async def generate_batch_images(
     files: list[UploadFile] = File(...),
-    seed: int = 0,
-    simplify: float = 0.95,
-    texture_size: int = 1024,
-    ss_guidance_strength: float = 7.5,
-    ss_sampling_steps: int = 30,
-    slat_guidance_strength: float = 3.0,
-    slat_sampling_steps: int = 12,
+    seed: int = Form(0, description="RNG seed，套用至 batch 內每張圖片"),
+    simplify: float = Form(0.95, ge=0.9, le=0.98, description="Mesh simplification ratio. Lower = fewer faces."),
+    texture_size: int = Form(1024, ge=512, le=2048, description="Texture atlas resolution in pixels. Recommended steps: 512, 1024, 1536, 2048."),
+    ss_guidance_strength: float = Form(7.5, ge=0.0, le=10.0, description="[Stage 1] Sparse structure CFG strength"),
+    ss_sampling_steps: int = Form(30, ge=1, le=50, description="[Stage 1] Sparse structure diffusion steps"),
+    slat_guidance_strength: float = Form(3.0, ge=0.0, le=10.0, description="[Stage 2] Structured latent CFG strength"),
+    slat_sampling_steps: int = Form(12, ge=1, le=50, description="[Stage 2] Structured latent diffusion steps"),
 ):
     """
     Batch Mode:
@@ -307,21 +307,15 @@ async def generate_batch_images(
 })
 async def generate_multi_image(
     files: list[UploadFile] = File(...),
-    seed: int = 0,
-    simplify: float = 0.95,
-    texture_size: int = 1024,
-    ss_guidance_strength: float = 7.5,
-    ss_sampling_steps: int = 30,
-    slat_guidance_strength: float = 3.0,
-    slat_sampling_steps: int = 12,
-    multiimage_algo: str = "multidiffusion"
+    seed: int = Form(0, description="RNG seed"),
+    simplify: float = Form(0.95, ge=0.9, le=0.98, description="Mesh simplification ratio. Lower = fewer faces."),
+    texture_size: int = Form(1024, ge=512, le=2048, description="Texture atlas resolution in pixels. Recommended steps: 512, 1024, 1536, 2048."),
+    ss_guidance_strength: float = Form(7.5, ge=0.0, le=10.0, description="[Stage 1] Sparse structure CFG strength"),
+    ss_sampling_steps: int = Form(30, ge=1, le=50, description="[Stage 1] Sparse structure diffusion steps"),
+    slat_guidance_strength: float = Form(3.0, ge=0.0, le=10.0, description="[Stage 2] Structured latent CFG strength"),
+    slat_sampling_steps: int = Form(12, ge=1, le=50, description="[Stage 2] Structured latent diffusion steps"),
+    multiimage_algo: Literal["stochastic", "multidiffusion"] = Form("multidiffusion", description="Multi-image fusion algorithm"),
 ):
-    if multiimage_algo not in VALID_MULTIIMAGE_ALGOS:
-        raise HTTPException(
-            status_code=422,
-            detail=f"Invalid multiimage_algo '{multiimage_algo}'. Must be one of: {sorted(VALID_MULTIIMAGE_ALGOS)}",
-        )
-
     try:
         if len(files) < 1:
             raise HTTPException(status_code=400, detail="請至少上傳一張圖片")

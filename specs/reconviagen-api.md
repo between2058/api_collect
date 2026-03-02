@@ -47,17 +47,17 @@ If model loading fails during the first request, a `503 MODEL_UNAVAILABLE` is re
 
 ## Shared Generation Parameters
 
-All three generation endpoints accept the following form fields:
+All three generation endpoints accept the following form fields. Constraints are enforced by Pydantic — values out of range return `422`.
 
-| Parameter | Type | Default | Description |
-|---|---|---|---|
-| `seed` | `integer` | `0` | RNG seed |
-| `simplify` | `float` | `0.95` | Mesh simplification ratio `(0, 1]`. Lower = fewer faces. |
-| `texture_size` | `integer` | `1024` | Texture atlas resolution in pixels |
-| `ss_guidance_strength` | `float` | `7.5` | Sparse structure — CFG strength |
-| `ss_sampling_steps` | `integer` | `30` | Sparse structure — diffusion steps |
-| `slat_guidance_strength` | `float` | `3.0` | SLaT decoder — CFG strength |
-| `slat_sampling_steps` | `integer` | `12` | SLaT decoder — diffusion steps |
+| Parameter | Type | Default | Range | Description |
+|---|---|---|---|---|
+| `seed` | `integer` | `0` | — | RNG seed |
+| `simplify` | `float` | `0.95` | `0.9` – `0.98` | Mesh simplification ratio. Lower = fewer faces. |
+| `texture_size` | `integer` | `1024` | `512` – `2048` | Texture atlas resolution in pixels. Recommended steps: 512, 1024, 1536, 2048. |
+| `ss_guidance_strength` | `float` | `7.5` | `0.0` – `10.0` | **[Stage 1]** Sparse structure — CFG strength |
+| `ss_sampling_steps` | `integer` | `30` | `1` – `50` | **[Stage 1]** Sparse structure — diffusion steps |
+| `slat_guidance_strength` | `float` | `3.0` | `0.0` – `10.0` | **[Stage 2]** Structured latent — CFG strength |
+| `slat_sampling_steps` | `integer` | `12` | `1` – `50` | **[Stage 2]** Structured latent — diffusion steps |
 
 ---
 
@@ -176,7 +176,7 @@ Generate a single 3D model from multiple images of the same subject simultaneous
 | Field | Type | Required | Default | Description |
 |---|---|---|---|---|
 | `files` | `List[UploadFile]` | ✅ | — | 2–N images of the same object from different angles |
-| `multiimage_algo` | `string` (Form) | ❌ | `"multidiffusion"` | Fusion algorithm: `"multidiffusion"` or `"stochastic"` |
+| `multiimage_algo` | `"stochastic" \| "multidiffusion"` (Form) | ❌ | `"multidiffusion"` | Fusion algorithm. Validated by `Literal` type — invalid values return `422`. |
 | *(shared params)* | Form fields | ❌ | — | See shared params |
 
 **Success Response** — `200 OK`

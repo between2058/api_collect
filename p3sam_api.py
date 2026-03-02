@@ -251,6 +251,43 @@ def classify_exception(e: Exception) -> tuple[int, str, str]:
         return 507, "DISK_FULL", "Server disk is full. Contact administrator."
     return 500, "INFERENCE_ERROR", str(e)
 
+# Swagger 文件用的 responses 描述
+GPU_ERROR_RESPONSES = {
+    503: {
+        "description": "GPU OOM 或模型/依賴不可用，稍後可重試（含 `Retry-After: 30` header）",
+        "content": {
+            "application/json": {
+                "examples": {
+                    "GPU_OOM": {
+                        "summary": "GPU out of memory",
+                        "value": {"detail": {"error_code": "GPU_OOM", "message": "GPU out of memory. Free some VRAM and retry."}},
+                    },
+                    "MODEL_UNAVAILABLE": {
+                        "summary": "AutoMask unavailable",
+                        "value": {"detail": {"error_code": "MODEL_UNAVAILABLE", "message": "AutoMask class not available."}},
+                    },
+                }
+            }
+        },
+    },
+    507: {
+        "description": "Server 磁碟空間不足，需人工介入",
+        "content": {
+            "application/json": {
+                "example": {"detail": {"error_code": "DISK_FULL", "message": "Server disk is full. Contact administrator."}}
+            }
+        },
+    },
+    500: {
+        "description": "未知推論錯誤，不可自動重試",
+        "content": {
+            "application/json": {
+                "example": {"detail": {"error_code": "INFERENCE_ERROR", "message": "<exception message>"}}
+            }
+        },
+    },
+}
+
 def release_model_memory(model):
     """
     強制釋放模型佔用的 CPU 和 GPU 記憶體。
@@ -275,7 +312,7 @@ async def health_check():
     }
 
 
-@app.post("/segment")
+@app.post("/segment", responses=GPU_ERROR_RESPONSES)
 async def segment_3d(
     file: UploadFile = File(...),
     point_num: int = Form(100000, description="點雲取樣數量，越大越精確但越慢"),

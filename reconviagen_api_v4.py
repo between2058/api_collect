@@ -54,6 +54,43 @@ def classify_exception(e: Exception) -> tuple[int, str, str]:
         return 507, "DISK_FULL", "Server disk is full. Contact administrator."
     return 500, "INFERENCE_ERROR", str(e)
 
+# Swagger 文件用的 responses 描述
+GPU_ERROR_RESPONSES = {
+    503: {
+        "description": "GPU OOM 或模型載入失敗，稍後可重試（含 `Retry-After: 30` header）",
+        "content": {
+            "application/json": {
+                "examples": {
+                    "GPU_OOM": {
+                        "summary": "GPU out of memory",
+                        "value": {"detail": {"error_code": "GPU_OOM", "message": "GPU out of memory. Free some VRAM and retry."}},
+                    },
+                    "MODEL_UNAVAILABLE": {
+                        "summary": "Model failed to load",
+                        "value": {"detail": {"error_code": "MODEL_UNAVAILABLE", "message": "Model loading failed: <reason>"}},
+                    },
+                }
+            }
+        },
+    },
+    507: {
+        "description": "Server 磁碟空間不足，需人工介入",
+        "content": {
+            "application/json": {
+                "example": {"detail": {"error_code": "DISK_FULL", "message": "Server disk is full. Contact administrator."}}
+            }
+        },
+    },
+    500: {
+        "description": "未知推論錯誤，不可自動重試",
+        "content": {
+            "application/json": {
+                "example": {"detail": {"error_code": "INFERENCE_ERROR", "message": "<exception message>"}}
+            }
+        },
+    },
+}
+
 app = FastAPI(title="ReconViaGen API")
 
 app.add_middleware(
@@ -105,7 +142,7 @@ async def health_check():
     }
 
 
-@app.post("/generate-single")
+@app.post("/generate-single", responses=GPU_ERROR_RESPONSES)
 async def generate_single_image(
     file: UploadFile = File(...),
     seed: int = 0,
@@ -150,7 +187,11 @@ async def generate_single_image(
             headers=headers,
         )
 
-@app.post("/generate-batch")
+@app.post("/generate-batch", responses={
+    **GPU_ERROR_RESPONSES,
+    207: {"description": "部分成功 — 部分圖片失敗，請檢查 results[].error_code"},
+    400: {"description": "未上傳任何圖片"},
+})
 async def generate_batch_images(
     files: list[UploadFile] = File(...),
     seed: int = 0,
@@ -260,7 +301,10 @@ async def generate_batch_images(
 
 
 
-@app.post("/generate-multi")
+@app.post("/generate-multi", responses={
+    **GPU_ERROR_RESPONSES,
+    400: {"description": "未上傳任何圖片"},
+})
 async def generate_multi_image(
     files: list[UploadFile] = File(...),
     seed: int = 0,

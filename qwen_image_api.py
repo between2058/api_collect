@@ -80,6 +80,43 @@ def classify_exception(e: Exception) -> tuple[int, str, str]:
     # 其他未知推論錯誤
     return 500, "INFERENCE_ERROR", str(e)
 
+# Swagger 文件用的 responses 描述（套用在所有推論 endpoint）
+GPU_ERROR_RESPONSES = {
+    503: {
+        "description": "GPU OOM 或模型載入失敗，稍後可重試（含 `Retry-After: 30` header）",
+        "content": {
+            "application/json": {
+                "examples": {
+                    "GPU_OOM": {
+                        "summary": "GPU out of memory",
+                        "value": {"detail": {"error_code": "GPU_OOM", "message": "GPU out of memory. Free some VRAM and retry."}},
+                    },
+                    "MODEL_UNAVAILABLE": {
+                        "summary": "Model failed to load",
+                        "value": {"detail": {"error_code": "MODEL_UNAVAILABLE", "message": "Model loading failed: <reason>"}},
+                    },
+                }
+            }
+        },
+    },
+    507: {
+        "description": "Server 磁碟空間不足，需人工介入",
+        "content": {
+            "application/json": {
+                "example": {"detail": {"error_code": "DISK_FULL", "message": "Server disk is full. Contact administrator."}}
+            }
+        },
+    },
+    500: {
+        "description": "未知推論錯誤，不可自動重試",
+        "content": {
+            "application/json": {
+                "example": {"detail": {"error_code": "INFERENCE_ERROR", "message": "<exception message>"}}
+            }
+        },
+    },
+}
+
 def save_image(image: Image.Image, folder: str, filename: str) -> str:
     path = os.path.join(folder, filename)
     image.save(path)
@@ -141,7 +178,7 @@ async def health_check():
 # ==========================================
 # MODEL 1: Text-to-Image (Text -> Image)
 # ==========================================
-@app.post("/text2img")
+@app.post("/text2img", responses=GPU_ERROR_RESPONSES)
 async def text_to_image(req: Text2ImgRequest):
     """
     [Model 1] Qwen-Image-2512
@@ -223,7 +260,7 @@ async def text_to_image(req: Text2ImgRequest):
 # ==========================================
 # MODEL 2: Edit (Image + Prompt -> Image)
 # ==========================================
-@app.post("/edit")
+@app.post("/edit", responses=GPU_ERROR_RESPONSES)
 async def edit_image(
     file: UploadFile = File(...),
     prompt: str = Form(..., description="編輯指令"),
@@ -311,7 +348,7 @@ async def edit_image(
 # ==========================================
 # MODEL 2: Edit Multi (Multiple Images + 1 Prompt)
 # ==========================================
-@app.post("/edit-multi")
+@app.post("/edit-multi", responses=GPU_ERROR_RESPONSES)
 async def edit_multi_images(
     files: List[UploadFile] = File(..., description="上傳多張圖片"),
     prompt: str = Form(..., description="編輯指令"),
@@ -407,7 +444,7 @@ async def edit_multi_images(
 # ==========================================
 # MODEL 3: Angle (Image + Angle -> Image)
 # ==========================================
-@app.post("/angle")
+@app.post("/angle", responses=GPU_ERROR_RESPONSES)
 async def change_angle(
     file: UploadFile = File(...),
     mode: str = Form("custom", description="'custom' for single angle, 'multi' for 3 views"),

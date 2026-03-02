@@ -16,11 +16,40 @@ No model is pre-loaded. Each endpoint loads the required model into GPU, runs in
 
 ---
 
+## Supported Image Formats
+
+All endpoints that accept image uploads validate the file extension. Accepted formats: `.png`, `.jpg`, `.jpeg`, `.webp`, `.bmp`, `.tiff`
+
+Unsupported formats return `422` immediately before any GPU work begins.
+
+---
+
 ## Endpoints
+
+### `GET /health`
+
+Returns server status and GPU lock state.
+
+**Success Response** — `200 OK`
+
+```json
+{
+  "status": "ok",
+  "device": "cuda",
+  "gpu_busy": false
+}
+```
+
+| Field | Description |
+|---|---|
+| `device` | `"cuda"` or `"cpu"` |
+| `gpu_busy` | `true` if a model is currently running inference |
+
+---
 
 ### `POST /text2img`
 
-Generate an image from a text prompt.
+Generate one or more images from a text prompt.
 
 **Request** — `application/json`
 
@@ -31,7 +60,8 @@ Generate an image from a text prompt.
   "aspect_ratio": "16:9",
   "num_steps": 50,
   "cfg_scale": 4.0,
-  "seed": 42
+  "seed": 42,
+  "num_samples": 1
 }
 ```
 
@@ -39,10 +69,11 @@ Generate an image from a text prompt.
 |---|---|---|---|---|
 | `prompt` | `string` | — | Required | Generation prompt |
 | `negative_prompt` | `string` | `"low quality, bad anatomy, blurry, distorted"` | — | Negative prompt |
-| `aspect_ratio` | `string` | `"16:9"` | One of: `"1:1"`, `"16:9"`, `"9:16"`, `"4:3"`, `"3:4"`, `"3:2"`, `"2:3"` | Output image aspect ratio. Invalid values silently fall back to `1024×1024`. |
+| `aspect_ratio` | `string` | `"16:9"` | One of the values in the table below | Output image aspect ratio |
 | `num_steps` | `integer` | `50` | > 0 | Number of diffusion steps |
 | `cfg_scale` | `float` | `4.0` | > 0 | Classifier-free guidance scale |
-| `seed` | `integer` | `42` | — | RNG seed for reproducibility |
+| `seed` | `integer` | random | — | RNG seed; ignored at runtime — each sample always gets its own independent random seed |
+| `num_samples` | `integer` | `1` | `1`–`8` | Number of images to generate in one call |
 
 **Aspect Ratio → Resolution Map**
 
@@ -62,15 +93,23 @@ Generate an image from a text prompt.
 {
   "status": "success",
   "request_id": "550e8400-e29b-41d4-a716-446655440000",
-  "url": "/download/550e8400-e29b-41d4-a716-446655440000/output.png"
+  "urls": [
+    "/download/550e8400-e29b-41d4-a716-446655440000/output_0.png",
+    "/download/550e8400-e29b-41d4-a716-446655440000/output_1.png"
+  ],
+  "seeds": [1827364910, 983741200]
 }
 ```
+
+> `urls` and `seeds` are parallel arrays — `seeds[i]` is the seed used to generate `urls[i]`.
 
 **Error Responses**
 
 | Status | Condition | `detail` example |
 |---|---|---|
-| `422` | Missing required `prompt` field | FastAPI validation error |
+| `422` | Missing required `prompt` | FastAPI validation error |
+| `422` | Invalid `aspect_ratio` | `"Invalid aspect_ratio '21:9'. Must be one of: ..."` |
+| `422` | `num_samples` out of range | `"num_samples must be between 1 and 8"` |
 | `500` | Model load failure (OOM, network, etc.) | `"<exception message>"` |
 | `500` | Inference failure | `"<exception message>"` |
 
@@ -84,7 +123,7 @@ Edit an image using a text instruction.
 
 | Field | Type | Required | Default | Description |
 |---|---|---|---|---|
-| `file` | `UploadFile` | ✅ | — | Input image (PNG/JPG/WEBP) |
+| `file` | `UploadFile` | ✅ | — | Input image |
 | `prompt` | `string` (Form) | ✅ | — | Editing instruction (e.g. `"Change the car color to red"`) |
 | `steps` | `integer` (Form) | ❌ | `40` | Diffusion steps |
 | `cfg_scale` | `float` (Form) | ❌ | `4.0` | Guidance scale |
@@ -106,6 +145,7 @@ Edit an image using a text instruction.
 | Status | Condition |
 |---|---|
 | `422` | Missing required form fields |
+| `422` | Unsupported image format |
 | `500` | Model load failure / inference failure |
 
 ---
@@ -149,6 +189,7 @@ Edit multiple images together using a single prompt. The model receives all imag
 | Status | Condition |
 |---|---|
 | `422` | Missing required form fields |
+| `422` | Any file has an unsupported image format |
 | `500` | Model load failure / inference failure |
 
 ---
@@ -167,13 +208,21 @@ Synthesise a new view of an object from a different camera angle.
 | `elevation` | `float` (Form) | ❌ | `0` | `-30` to `60` | Vertical angle in degrees |
 | `distance` | `float` (Form) | ❌ | `1.0` | `0.6`, `1.0`, or `1.8` | Camera distance |
 
-**Angle snapping:** Azimuth, elevation, and distance are snapped to the nearest supported value:
+> `azimuth`, `elevation`, and `distance` are only used when `mode="custom"`.
+
+**Angle snapping:** All three parameters are snapped to the nearest supported value before building the prompt.
 
 | Axis | Supported values |
 |---|---|
 | Azimuth | `0`, `45`, `90`, `135`, `180`, `225`, `270`, `315` |
 | Elevation | `-30`, `0`, `30`, `60` |
 | Distance | `0.6`, `1.0`, `1.8` |
+
+**LoRAs loaded at runtime:**
+- `lightx2v/Qwen-Image-Edit-2511-Lightning` — 4-step lightning adapter
+- `fal/Qwen-Image-Edit-2511-Multiple-Angles-LoRA` — angle synthesis adapter
+
+Both adapters are set with `adapter_weights=[1.0, 1.0]` and inference runs with `num_inference_steps=4`, `guidance_scale=1.0`.
 
 **Success Response — `mode="custom"`** — `200 OK`
 
@@ -208,6 +257,8 @@ Synthesise a new view of an object from a different camera angle.
 | Status | Condition |
 |---|---|
 | `422` | Missing required `file` |
+| `422` | Unsupported image format |
+| `422` | Invalid `mode` (not `"custom"` or `"multi"`) |
 | `500` | LoRA load failure / model failure / inference failure |
 
 ---
@@ -219,9 +270,9 @@ Download a generated output file.
 | Param | Type | Description |
 |---|---|---|
 | `request_id` | `string` | UUID4 from any endpoint's response |
-| `file_name` | `string` | e.g. `output.png`, `result.png`, `result_stitched.png` |
+| `file_name` | `string` | e.g. `output_0.png`, `result.png`, `result_stitched.png`, `output_custom.png` |
 
-**Success Response** — `200 OK`, Content-Type: `image/png` (default) or inferred by FastAPI.
+**Success Response** — `200 OK`, Content-Type: inferred by FastAPI from the file extension.
 
 **Error Responses**
 
@@ -234,3 +285,5 @@ Download a generated output file.
 ## Known Limitations
 
 - GPU lock serialises all requests; concurrent calls queue behind the lock.
+- Output files are stored in a temporary directory and deleted on server shutdown.
+- The `seed` field in `/text2img` requests is accepted but ignored — each sample always uses its own independently drawn random seed.

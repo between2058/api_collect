@@ -328,13 +328,13 @@ async def health_check():
 @app.post("/segment", response_model=SegmentResponse, responses=GPU_ERROR_RESPONSES)
 async def segment_3d(
     file: UploadFile = File(...),
-    point_num: int = Form(100000, description="點雲取樣數量，越大越精確但越慢"),
-    prompt_num: int = Form(400, description="分割 Prompt 數量"),
-    threshold: float = Form(0.95, description="分割信心閾值 (0.0–1.0)"),
+    point_num: int = Form(100000, ge=1000, le=500000, description="點雲取樣數量，越大越精確但越慢"),
+    prompt_num: int = Form(400, ge=10, le=1000, description="分割 Prompt 數量"),
+    threshold: float = Form(0.95, ge=0.0, le=1.0, description="分割信心閾值"),
     post_process: bool = Form(True, description="是否套用後處理"),
     clean_mesh: bool = Form(True, description="推論前是否清理 Mesh"),
     seed: int = Form(42, description="隨機種子，控制點雲取樣與 Prompt 選取的可重現性"),
-    prompt_bs: int = Form(32, description="Prompt 推理 batch size，越大越快但佔用更多 VRAM"),
+    prompt_bs: int = Form(32, ge=1, le=400, description="Prompt 推理 batch size，越大越快但佔用更多 VRAM"),
 ):
     ext = os.path.splitext(file.filename or '')[1].lower()
     if ext not in SUPPORTED_MESH_EXTENSIONS:
@@ -342,15 +342,6 @@ async def segment_3d(
             status_code=422,
             detail=f"Unsupported file type '{ext}'. Must be one of: {sorted(SUPPORTED_MESH_EXTENSIONS)}",
         )
-
-    if not (1000 <= point_num <= 500000):
-        raise HTTPException(status_code=422, detail="point_num must be between 1000 and 500000")
-    if not (10 <= prompt_num <= 1000):
-        raise HTTPException(status_code=422, detail="prompt_num must be between 10 and 1000")
-    if not (0.0 <= threshold <= 1.0):
-        raise HTTPException(status_code=422, detail="threshold must be between 0.0 and 1.0")
-    if not (1 <= prompt_bs <= 400):
-        raise HTTPException(status_code=422, detail="prompt_bs must be between 1 and 400")
 
     model = None # 初始化變數以便 finally 區塊存取
 

@@ -9,7 +9,7 @@ import random
 import torch
 import tempfile
 import numpy as np
-from typing import List, Optional
+from typing import Dict, List, Optional
 from PIL import Image
 
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
@@ -21,6 +21,45 @@ import traceback
 
 # --- Diffusers Imports ---
 from diffusers import QwenImagePipeline, QwenImageEditPlusPipeline
+
+# --- Response Schemas ---
+
+class HealthResponse(BaseModel):
+    status: str
+    device: str = Field(description="'cuda' 或 'cpu'")
+    gpu_busy: bool = Field(description="GPU Lock 是否鎖定中（是否有推論正在執行）")
+
+class Text2ImgResponse(BaseModel):
+    status: str
+    request_id: str
+    urls: List[str] = Field(description="生成圖片的下載路徑列表，與 seeds 一一對應")
+    seeds: List[int] = Field(description="每張圖片實際使用的 RNG seed，與 urls 一一對應")
+
+class EditResponse(BaseModel):
+    status: str
+    request_id: str
+    input_url: str = Field(description="上傳的原始圖片下載路徑")
+    result_urls: List[str] = Field(description="編輯結果圖片路徑列表，與 seeds 一一對應")
+    seeds: List[int] = Field(description="每張結果使用的 RNG seed，與 result_urls 一一對應")
+
+class EditMultiResponse(BaseModel):
+    status: str
+    request_id: str
+    count: int = Field(description="上傳的圖片數量")
+    inputs: List[str] = Field(description="上傳的原始圖片路徑列表")
+    results: List[str] = Field(description="編輯結果路徑列表（目前固定為一張拼接大圖，故 len=1）")
+
+class AngleResponse(BaseModel):
+    status: str
+    request_id: str
+    input_url: str = Field(description="上傳的原始圖片下載路徑")
+    results: Dict[str, str] = Field(
+        description=(
+            "生成的視角圖片 URL map。"
+            "mode=custom 時 key 為 'custom'；"
+            "mode=multi 時 key 為 'right', 'back', 'left'"
+        )
+    )
 
 # --- 1. 初始化設定 ---
 app = FastAPI(title="Qwen All-in-One API (Text2Img, Edit, Angle)")
@@ -166,7 +205,7 @@ class Text2ImgRequest(BaseModel):
     seed: int = Field(default_factory=lambda: random.randint(0, MAX_SEED))
     num_samples: int = 1  # 生成張數，每張使用獨立隨機 seed
 
-@app.get("/health")
+@app.get("/health", response_model=HealthResponse)
 async def health_check():
     return {
         "status": "ok",
@@ -178,7 +217,7 @@ async def health_check():
 # ==========================================
 # MODEL 1: Text-to-Image (Text -> Image)
 # ==========================================
-@app.post("/text2img", responses=GPU_ERROR_RESPONSES)
+@app.post("/text2img", response_model=Text2ImgResponse, responses=GPU_ERROR_RESPONSES)
 async def text_to_image(req: Text2ImgRequest):
     """
     [Model 1] Qwen-Image-2512
@@ -260,7 +299,7 @@ async def text_to_image(req: Text2ImgRequest):
 # ==========================================
 # MODEL 2: Edit (Image + Prompt -> Image)
 # ==========================================
-@app.post("/edit", responses=GPU_ERROR_RESPONSES)
+@app.post("/edit", response_model=EditResponse, responses=GPU_ERROR_RESPONSES)
 async def edit_image(
     file: UploadFile = File(...),
     prompt: str = Form(..., description="編輯指令"),
@@ -348,7 +387,7 @@ async def edit_image(
 # ==========================================
 # MODEL 2: Edit Multi (Multiple Images + 1 Prompt)
 # ==========================================
-@app.post("/edit-multi", responses=GPU_ERROR_RESPONSES)
+@app.post("/edit-multi", response_model=EditMultiResponse, responses=GPU_ERROR_RESPONSES)
 async def edit_multi_images(
     files: List[UploadFile] = File(..., description="上傳多張圖片"),
     prompt: str = Form(..., description="編輯指令"),
@@ -444,7 +483,7 @@ async def edit_multi_images(
 # ==========================================
 # MODEL 3: Angle (Image + Angle -> Image)
 # ==========================================
-@app.post("/angle", responses=GPU_ERROR_RESPONSES)
+@app.post("/angle", response_model=AngleResponse, responses=GPU_ERROR_RESPONSES)
 async def change_angle(
     file: UploadFile = File(...),
     mode: str = Form("custom", description="'custom' for single angle, 'multi' for 3 views"),

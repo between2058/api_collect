@@ -9,7 +9,7 @@ import torch
 import numpy as np
 import imageio
 from PIL import Image
-from typing import Literal
+from typing import Dict, List, Literal, Optional, Union
 
 # --- 1. 環境變數設定 (必須在所有 import 之前) ---
 os.environ['SPCONV_ALGO'] = 'native'
@@ -18,12 +18,46 @@ from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.concurrency import run_in_threadpool
+from pydantic import BaseModel, Field
 
 # --- ReconViaGen 特有的 Imports ---
 from trellis.pipelines import TrellisVGGTTo3DPipeline
 from trellis.utils import render_utils, postprocessing_utils
 
 # multiimage_algo 的合法值由 Literal 型別在 endpoint 層自動驗證，不再需要手動 set
+
+# --- Response Schemas ---
+
+class HealthResponse(BaseModel):
+    status: str
+    model_loaded: bool = Field(description="模型是否已載入記憶體（Lazy Load，第一次請求後才會為 true）")
+    gpu_busy: bool = Field(description="GPU Lock 是否鎖定中")
+
+class GenerationOutput(BaseModel):
+    gaussian_video: str = Field(description="120 幀 Gaussian Splat 環繞影片路徑（15 fps）")
+    radiance_video: str = Field(description="同 gaussian_video（為前端相容性保留的副本）")
+    mesh_video: str = Field(description="120 幀 Mesh 法線著色環繞影片路徑（15 fps）")
+    glb_file: str = Field(description="最終含貼圖的 GLB 檔案路徑")
+    ply_file: str = Field(description="Gaussian Splat PLY 點雲路徑")
+
+class BatchItemResult(BaseModel):
+    original_filename: str = Field(description="上傳時的原始檔名")
+    status: Literal["success", "failed"]
+    # 成功欄位（status=success 時有值）
+    gaussian_video: Optional[str] = Field(None, description="成功時：Gaussian Splat 影片路徑")
+    radiance_video: Optional[str] = Field(None, description="成功時：Radiance 影片路徑")
+    mesh_video: Optional[str] = Field(None, description="成功時：Mesh 影片路徑")
+    glb_file: Optional[str] = Field(None, description="成功時：GLB 檔案路徑")
+    ply_file: Optional[str] = Field(None, description="成功時：PLY 點雲路徑")
+    # 失敗欄位（status=failed 時有值）
+    error_code: Optional[str] = Field(None, description="失敗時：錯誤代碼，例如 GPU_OOM、INFERENCE_ERROR")
+    error: Optional[str] = Field(None, description="失敗時：錯誤說明")
+
+class BatchResponse(BaseModel):
+    total_count: int = Field(description="送入的圖片總數")
+    succeeded: int = Field(description="成功完成的數量")
+    failed: int = Field(description="失敗的數量")
+    results: List[BatchItemResult] = Field(description="每張圖片的處理結果，順序與上傳順序一致")
 
 def flush_gpu():
     """強制清理 GPU 記憶體"""
@@ -133,7 +167,7 @@ def ensure_model_loaded():
         # 模型已經在記憶體中，直接略過
         pass
 
-@app.get("/health")
+@app.get("/health", response_model=HealthResponse)
 async def health_check():
     return {
         "status": "ok",
@@ -142,7 +176,7 @@ async def health_check():
     }
 
 
-@app.post("/generate-single", responses=GPU_ERROR_RESPONSES)
+@app.post("/generate-single", response_model=GenerationOutput, responses=GPU_ERROR_RESPONSES)
 async def generate_single_image(
     file: UploadFile = File(...),
     seed: int = Form(0, description="RNG seed"),
@@ -187,7 +221,7 @@ async def generate_single_image(
             headers=headers,
         )
 
-@app.post("/generate-batch", responses={
+@app.post("/generate-batch", response_model=BatchResponse, responses={
     **GPU_ERROR_RESPONSES,
     207: {"description": "部分成功 — 部分圖片失敗，請檢查 results[].error_code"},
     400: {"description": "未上傳任何圖片"},
@@ -301,7 +335,7 @@ async def generate_batch_images(
 
 
 
-@app.post("/generate-multi", responses={
+@app.post("/generate-multi", response_model=GenerationOutput, responses={
     **GPU_ERROR_RESPONSES,
     400: {"description": "未上傳任何圖片"},
 })

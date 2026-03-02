@@ -164,10 +164,12 @@ import trimesh
 import gc  # 引入 garbage collection
 import numpy as np
 import torch # 引入 torch 以控制顯存
+from typing import List
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.concurrency import run_in_threadpool
+from pydantic import BaseModel, Field
 import uvicorn
 import traceback
 
@@ -177,6 +179,17 @@ try:
 except ImportError as e:
     print(f"Warning: Could not import AutoMask. Dependencies might be missing. Error: {e}")
     AutoMask = None
+
+# --- Response Schemas ---
+
+class HealthResponse(BaseModel):
+    status: str
+    model_available: bool = Field(description="AutoMask 是否成功 import（False 表示依賴未安裝）")
+
+class SegmentResponse(BaseModel):
+    segmented_glb: str = Field(description="分割結果 GLB 的下載路徑，傳入 GET /download/{request_id}/{file_name}")
+    request_id: str = Field(description="此次請求的 UUID")
+    num_parts: int = Field(description="偵測到的零件數量（face label >= 0 的唯一 ID 數）")
 
 app = FastAPI(title="P3-SAM 3D Segmentation API")
 
@@ -304,7 +317,7 @@ def release_model_memory(model):
     except Exception as cleanup_err:
         print(f"⚠️ GPU memory cleanup failed (non-critical): {type(cleanup_err).__name__}: {cleanup_err}")
 
-@app.get("/health")
+@app.get("/health", response_model=HealthResponse)
 async def health_check():
     return {
         "status": "ok",
@@ -312,7 +325,7 @@ async def health_check():
     }
 
 
-@app.post("/segment", responses=GPU_ERROR_RESPONSES)
+@app.post("/segment", response_model=SegmentResponse, responses=GPU_ERROR_RESPONSES)
 async def segment_3d(
     file: UploadFile = File(...),
     point_num: int = Form(100000, description="點雲取樣數量，越大越精確但越慢"),
